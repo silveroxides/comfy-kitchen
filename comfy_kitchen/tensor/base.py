@@ -223,7 +223,6 @@ class QuantizedTensor(torch.Tensor):
     # ==================== Factory Methods ====================
 
     @classmethod
-    @torch.compiler.disable
     def from_float(
         cls,
         tensor: torch.Tensor,
