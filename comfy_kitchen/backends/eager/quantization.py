@@ -49,8 +49,9 @@ def quantize_per_tensor_fp8(
             f"Unsupported output_type: {output_type}. Expected torch.float8_e4m3fn or torch.float8_e5m2"
         )
 
-    q_tensor = torch.clamp(x * (1.0 / scale).to(x.dtype), -lp_max, lp_max).to(output_type)
-    return q_tensor
+    temp = x * (1.0 / scale).to(x.dtype)
+    temp = torch.clamp(temp, -lp_max, lp_max, out=temp)
+    return temp.to(output_type)
 
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
