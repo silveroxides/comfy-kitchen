@@ -8,6 +8,8 @@ from comfy_kitchen.tensor import (
     TensorCoreNVFP4Layout,
 )
 
+from .conftest import assert_values_close
+
 
 class DummyQuantizedModel(torch.nn.Module):
     """Simple model for testing CUDA graph capture and torch.compile with quantized weights.
@@ -39,12 +41,15 @@ class DummyQuantizedModel(torch.nn.Module):
         self.w1 = QuantizedTensor.from_float(w1, layout_cls)
         self.w2 = QuantizedTensor.from_float(w2, layout_cls)
 
+        self.register_buffer("input_scale", torch.tensor(48.0, device=device, dtype=torch.float32))
+        self.register_buffer("hidden_scale", torch.tensor(96.0, device=device, dtype=torch.float32))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Quantize input -> matmul -> activation -> quantize -> matmul
-        x_q = QuantizedTensor.from_float(x, self.layout_cls)
+        x_q = QuantizedTensor.from_float(x, self.layout_cls, scale=self.input_scale)
         h = torch.nn.functional.linear(x_q, self.w1)
         h = torch.nn.functional.gelu(h)
-        h_q = QuantizedTensor.from_float(h, self.layout_cls)
+        h_q = QuantizedTensor.from_float(h, self.layout_cls, scale=self.hidden_scale)
         return torch.nn.functional.linear(h_q, self.w2)
 
 
@@ -191,7 +196,7 @@ class TestQuantizedCompile:
         # Verify outputs match
         assert compiled_output.shape == ref_output.shape
         assert compiled_output.dtype == ref_output.dtype
-        assert torch.allclose(compiled_output, ref_output, rtol=0.1, atol=0.1)
+        assert_values_close(compiled_output, ref_output, rtol=1e-3, atol=1e-3, name="compiled_output")
 
     @pytest.mark.parametrize("model", LAYOUT_CONFIGS, indirect=True)
     def test_compile_model_multiple_runs(self, model):

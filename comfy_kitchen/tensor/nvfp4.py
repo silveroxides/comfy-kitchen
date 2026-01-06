@@ -44,6 +44,10 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
             """Override to include block_scale in tensor operations."""
             return ["scale", "block_scale"]
 
+        def _validate_tensor_fields(self):
+            if isinstance(self.scale, torch.Tensor):
+                object.__setattr__(self, "scale", self.scale.to(dtype=torch.float32, non_blocking=True))
+
     @classmethod
     def quantize(
         cls,
