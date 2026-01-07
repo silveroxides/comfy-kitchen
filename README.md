@@ -11,6 +11,9 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `quantize_nvfp4`            | ✓     | ✓    | ✓      |
 | `dequantize_nvfp4`          | ✓     | ✓    |        |
 | `scaled_mm_nvfp4`           | ✓     | ✓    |        |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |
+| `dequantize_mxfp8`          | ✓     |      |        |
+| `scaled_mm_mxfp8`           | ✓     |      |        |
 | `apply_rope`                | ✓     | ✓    | ✓      |
 | `apply_rope1`               | ✓     | ✓    | ✓      |
 
@@ -23,9 +26,10 @@ The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transpare
 |------------------------|--------------|-----------------|----------------------------------------|
 | `TensorCoreFP8Layout`  | FP8 E4M3     | SM ≥ 8.9 (Ada)  | Per-tensor scaling, 1:1 element mapping |
 | `TensorCoreNVFP4Layout`| NVFP4 E2M1   | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks |
+| `TensorCoreMXFP8Layout`| MXFP8 E4M3   | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
 
 ```python
-from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout
+from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout
 
 # Quantize a tensor
 x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
@@ -75,12 +79,12 @@ pip install -e . --no-build-isolation -v
 
 These options require using `setup.py` directly (not `pip install`):
 
-| Option | Command | Description | Default                                                                     |
-|--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA)                                                   |
-| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
-| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
-| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
+| Option | Command | Description | Default |
+|--------|---------|-------------|---------|
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA) |
+| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `70-virtual;80;89;90a;100f;120f` (Linux), `70-virtual;80;89;120f` (Windows) |
+| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release) |
+| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled |
 
 ```bash
 # Build CPU-only wheel (pure Python, no CUDA required)
@@ -165,21 +169,3 @@ import logging
 logging.getLogger("comfy_kitchen.dispatch").setLevel(logging.DEBUG)
 ```
 
-
-## Testing
-
-Run the test suite with pytest:
-
-```bash
-# Run all tests
-pytest
-
-# Run specific test file
-pytest tests/test_backends.py
-
-# Run with verbose output
-pytest -v
-
-# Run specific test
-pytest tests/test_backends.py::TestBackendSystem::test_list_backends
-```
