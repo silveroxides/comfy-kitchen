@@ -12,6 +12,8 @@ from typing import Any
 import torch
 import torch._dynamo
 
+logger = logging.getLogger(__name__)
+
 LAYOUTS = {}
 
 
@@ -346,7 +348,7 @@ class QuantizedTensor(torch.Tensor):
                     return op_handlers[parent_cls](qt, args, kwargs)
 
         # Step 3: Fallback to dequantization
-        logging.debug(f"QuantizedTensor: Unhandled op {func}, falling back to dequantize")
+        logger.debug(f"Unhandled op {func} for {layout_cls.__name__ if layout_cls else 'unknown'}, dequantizing")
         return cls._dequant_and_fallback(func, args, kwargs)
 
     @classmethod

@@ -176,6 +176,38 @@ def _handle_mxfp8_mm(qt, args, kwargs):
         return torch.mm(*dequantize_args(args))
 
 
+@register_layout_op(torch.ops.aten.addmm.default, TensorCoreMXFP8Layout)
+def _handle_mxfp8_addmm(qt, args, kwargs):
+    """MXFP8 addmm: bias + input @ weight.T (decomposed from F.linear with bias)."""
+    from .base import QuantizedTensor
+
+    bias, mat1, mat2 = args[0], args[1], args[2]
+
+    if not (isinstance(mat1, QuantizedTensor) and isinstance(mat2, QuantizedTensor)):
+        return torch.addmm(*dequantize_args((bias, mat1, mat2)))
+    if mat1._qdata.dim() != 2:
+        return torch.addmm(*dequantize_args((bias, mat1, mat2)))
+
+    input_transposed = getattr(mat1._params, "transposed", False)
+    weight_transposed = getattr(mat2._params, "transposed", False)
+
+    if input_transposed or not weight_transposed:
+        return torch.addmm(*dequantize_args((bias, mat1, mat2)))
+
+    input_qdata, scale_a = TensorCoreMXFP8Layout.get_plain_tensors(mat1)
+    weight_qdata, scale_b = TensorCoreMXFP8Layout.get_plain_tensors(mat2)
+    out_dtype = mat1._params.orig_dtype
+
+    try:
+        result = _mxfp8_scaled_mm(input_qdata, weight_qdata, scale_a, scale_b, bias, out_dtype)
+        orig_m = mat1._params.orig_shape[0]
+        orig_n = mat2._params.orig_shape[1]
+        return _slice_to_original_shape(result, orig_m, orig_n)
+    except (RuntimeError, TypeError) as e:
+        logger.warning(f"MXFP8 addmm failed: {e}")
+        return torch.addmm(*dequantize_args((bias, mat1, mat2)))
+
+
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreMXFP8Layout)
 def _handle_mxfp8_linear(qt, args, kwargs):
     """MXFP8 linear: input @ weight.T + bias."""
