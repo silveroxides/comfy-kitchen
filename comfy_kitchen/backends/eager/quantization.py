@@ -19,6 +19,7 @@ from comfy_kitchen.float_utils import (
     roundup,
     to_blocked,
 )
+from comfy_kitchen.scaled_mm_v2 import scaled_mm_blockwise
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -170,23 +171,16 @@ def scaled_mm_nvfp4(
     out_dtype: torch.dtype | None = None,
     alpha: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if alpha is None:
-        alpha = tensor_scale_a * tensor_scale_b
-    should_add_bias_separately = bias is not None
-
-    result = torch._scaled_mm(
+    result = scaled_mm_blockwise(
         a.view(torch.float4_e2m1fn_x2),
         b.view(torch.float4_e2m1fn_x2).t(),
-        block_scale_a.view(-1),
-        block_scale_b.view(-1),
-        bias=None if should_add_bias_separately else bias,
+        block_scale_a=block_scale_a,
+        tensor_scale_a=tensor_scale_a,
+        block_scale_b=block_scale_b,
+        tensor_scale_b=tensor_scale_b,
+        bias=bias,
         out_dtype=out_dtype,
-        # scale_result=alpha,  # Not supported yet
     )
-    result = result * alpha.to(out_dtype)
-
-    if should_add_bias_separately:
-        result = result + bias
 
     return result
 
