@@ -45,7 +45,7 @@ class CMakeBuildExt(build_ext):
     ]
 
     # Default values for options
-    DEFAULT_CUDA_ARCHS_WINDOWS = "75-virtual;80;89;120f"  # No need for Datacenter GPUs
+    DEFAULT_CUDA_ARCHS_WINDOWS = "75-virtual;80;89;120f"  # SM75+ (Turing), no Datacenter GPUs
     DEFAULT_CUDA_ARCHS_LINUX = "75-virtual;80;89;90a;100f;120f"  # + H100, B100
 
     def initialize_options(self):
@@ -188,7 +188,7 @@ def get_cuda_version() -> tuple[int, ...] | None:
     _cuda_home, nvcc_bin = get_cuda_path()
     try:
         output = subprocess.run(
-            [nvcc_bin, "-V"],
+            [nvcc_bin, "-V", "--threads=12", "--gpu-architecture='sm_80,sm_89,sm_120f'"],
             capture_output=True,
             check=True,
             text=True,
