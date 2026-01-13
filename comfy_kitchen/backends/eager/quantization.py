@@ -329,16 +329,6 @@ def scaled_mm_mxfp8(
 
     Scales are expected to be in swizzled (SWIZZLE_32_4_4) format from quantize_mxfp8.
     """
-    # DEBUG: Print shapes for diagnosis
-    import os
-    if os.environ.get("MXFP8_DEBUG"):
-        print(f"[MXFP8] a: {a.shape} {a.dtype}, b: {b.shape} {b.dtype}")
-        print(f"[MXFP8] b.t(): {b.t().shape}")
-        print(f"[MXFP8] scale_a: {block_scale_a.shape} {block_scale_a.dtype}")
-        print(f"[MXFP8] scale_b: {block_scale_b.shape} {block_scale_b.dtype}")
-        print(f"[MXFP8] Expected scale_a: [{a.shape[0]}, {a.shape[1]//32}] swizzled")
-        print(f"[MXFP8] Expected scale_b for b: [{b.shape[0]}, {b.shape[1]//32}] swizzled")
-    
     result = scaled_mm_v2(
         a,
         b.t(),  # Transpose b for linear semantics: a @ b.T
