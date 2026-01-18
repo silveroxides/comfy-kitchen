@@ -188,7 +188,7 @@ def get_cuda_version() -> tuple[int, ...] | None:
     _cuda_home, nvcc_bin = get_cuda_path()
     try:
         output = subprocess.run(
-            [nvcc_bin, "-V", "--threads=12", "--gpu-architecture='sm_80,sm_89,sm_120f'"],
+            [nvcc_bin, "-V", "--threads=12"],
             capture_output=True,
             check=True,
             text=True,
