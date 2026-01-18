@@ -742,3 +742,427 @@ def quantize_mxfp8(
     swizzled_scales = swizzled_scales.view(torch.float8_e8m0fnu)
 
     return output, swizzled_scales
+
+
+# =============================================================================
+# INT8 Block-wise Quantization
+# =============================================================================
+
+@triton.jit
+def int8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+    """Quantizes activation tensor block-wise along the last dimension.
+
+    Args:
+        x_ptr: Pointer to the input tensor.
+        y_ptr: Pointer to the output quantized tensor.
+        s_ptr: Pointer to the output scaling factors.
+        BLOCK_SIZE: The size of each quantization block.
+    """
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    amax = tl.max(tl.abs(x))
+    s = amax / 127.0
+    y = x / s
+    y = y.to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + offs, y)
+    tl.store(s_ptr + pid, s)
+
+
+def quantize_int8_blockwise(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations to INT8 with block-wise scaling.
+
+    Args:
+        x: Input tensor, last dim must be divisible by block_size.
+        block_size: Size of quantization blocks (default 128).
+
+    Returns:
+        Tuple of (qdata, scale):
+            - qdata: Quantized INT8 tensor with same shape as input
+            - scale: Per-block scaling factors, shape [..., K//block_size]
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.size(-1) % block_size == 0, (
+        f"Last dimension {x.size(-1)} must be divisible by block_size {block_size}"
+    )
+
+    y = torch.empty_like(x, dtype=torch.int8)
+    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+
+    num_programs = s.numel()
+    grid = lambda meta: (num_programs,)
+    int8_act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+
+    return y, s
+
+
+@triton.jit
+def int8_act_dequant_kernel(x_ptr, s_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    """Dequantizes activation tensor using block-wise scaling.
+
+    Args:
+        x_ptr: Pointer to the quantized input tensor.
+        s_ptr: Pointer to the scaling factors.
+        y_ptr: Pointer to the output dequantized tensor.
+        BLOCK_SIZE: The size of each quantization block.
+    """
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    s = tl.load(s_ptr + pid)
+    y = x * s
+    y = y.to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + offs, y)
+
+
+def dequantize_int8_blockwise(
+    qx: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize INT8 activations with block-wise scaling.
+
+    Args:
+        qx: Quantized INT8 tensor.
+        scale: Per-block scaling factors.
+        block_size: Block size used for quantization.
+        output_dtype: Target output dtype.
+
+    Returns:
+        Dequantized tensor with original shape.
+    """
+    assert qx.is_contiguous() and scale.is_contiguous(), "Tensors must be contiguous"
+    assert qx.size(-1) % block_size == 0, (
+        f"Last dimension {qx.size(-1)} must be divisible by block_size {block_size}"
+    )
+
+    y = torch.empty_like(qx, dtype=output_dtype)
+    num_programs = scale.numel()
+    grid = lambda meta: (num_programs,)
+    int8_act_dequant_kernel[grid](qx, scale, y, BLOCK_SIZE=block_size)
+
+    return y
+
+
+@triton.jit
+def int8_weight_quant_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    """Quantizes 2D weight tensor with block-wise scaling.
+
+    Args:
+        x_ptr: Pointer to the input weights.
+        y_ptr: Pointer to the output quantized weights.
+        s_ptr: Pointer to the output scaling factors.
+        M: Number of rows.
+        N: Number of columns.
+        BLOCK_SIZE: Size of each block for quantization.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    amax = tl.max(tl.abs(x))
+    s = amax / 127.0
+
+    y = x / s
+    y = y.to(y_ptr.dtype.element_ty)
+
+    tl.store(y_ptr + offs, y, mask=mask)
+    tl.store(s_ptr + pid_m * n + pid_n, s)
+
+
+def quantize_int8_weight(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 2D weights to INT8 with 2D block-wise scaling.
+
+    Args:
+        x: 2D weight tensor (M, N), dims must be divisible by block_size.
+        block_size: Size of quantization blocks (default 128).
+
+    Returns:
+        Tuple of (qdata, scale):
+            - qdata: Quantized INT8 tensor (M, N)
+            - scale: Per-block scaling factors (M//block_size, N//block_size)
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.dim() == 2, f"Weight must be 2D, got {x.dim()}D"
+
+    M, N = x.size()
+    assert M % block_size == 0 and N % block_size == 0, (
+        f"Dimensions must be divisible by block_size={block_size}, got shape {x.shape}"
+    )
+
+    y = torch.empty_like(x, dtype=torch.int8)
+    s = x.new_empty(M // block_size, N // block_size, dtype=torch.float32)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE"]),
+        triton.cdiv(N, meta["BLOCK_SIZE"]),
+    )
+    int8_weight_quant_kernel[grid](x, y, s, M, N, BLOCK_SIZE=block_size)
+
+    return y, s
+
+
+@triton.jit
+def int8_weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    """Dequantizes 2D weight tensor using block-wise scaling.
+
+    Args:
+        x_ptr: Pointer to the quantized weights.
+        s_ptr: Pointer to the scaling factors.
+        y_ptr: Pointer to the output dequantized weights.
+        M: Number of rows.
+        N: Number of columns.
+        BLOCK_SIZE: Size of each block.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(s_ptr + pid_m * n + pid_n)
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def dequantize_int8_weight(
+    qx: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize INT8 weights with 2D block-wise scaling.
+
+    Args:
+        qx: Quantized INT8 tensor (M, N).
+        scale: Per-block scaling factors (M//block_size, N//block_size).
+        block_size: Block size used for quantization.
+        output_dtype: Target output dtype.
+
+    Returns:
+        Dequantized tensor (M, N).
+    """
+    assert qx.is_contiguous() and scale.is_contiguous(), "Tensors must be contiguous"
+    assert qx.dim() == 2 and scale.dim() == 2, "Tensors must be 2D"
+
+    M, N = qx.size()
+    y = torch.empty_like(qx, dtype=output_dtype)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE"]),
+        triton.cdiv(N, meta["BLOCK_SIZE"]),
+    )
+    int8_weight_dequant_kernel[grid](qx, scale, y, M, N, BLOCK_SIZE=block_size)
+
+    return y
+
+
+@triton.jit
+def int8_gemm_kernel(
+    a_ptr, b_ptr, c_ptr, a_s_ptr, b_s_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """INT8 matrix multiplication kernel with per-block scaling.
+
+    Computes: C = (A @ B^T) with INT8 inputs and per-block scaling.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
+    a_s_ptrs = a_s_ptr + offs_m * k
+
+    k_blocks = k
+    b_s_base = b_s_ptr + pid_n * k_blocks
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k_blocks):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0)
+        a_s = tl.load(a_s_ptrs)
+        b_s = tl.load(b_s_base + i)
+
+        dot_prod = tl.dot(a, b, out_dtype=tl.int32)
+        accumulator += dot_prod.to(tl.float32) * a_s[:, None] * b_s
+
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+        a_s_ptrs += 1
+
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+@triton.jit
+def int8_gemm_addmm_kernel(
+    a_ptr, b_ptr, c_ptr, bias_ptr, a_s_ptr, b_s_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """INT8 matrix multiplication with fused bias addition.
+
+    Computes: C = (A @ B^T) + bias
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
+    a_s_ptrs = a_s_ptr + offs_m * k
+
+    k_blocks = k
+    b_s_base = b_s_ptr + pid_n * k_blocks
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k_blocks):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0)
+        a_s = tl.load(a_s_ptrs)
+        b_s = tl.load(b_s_base + i)
+
+        dot_prod = tl.dot(a, b, out_dtype=tl.int32)
+        accumulator += dot_prod.to(tl.float32) * a_s[:, None] * b_s
+
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+        a_s_ptrs += 1
+
+    # Add bias if provided
+    if HAS_BIAS:
+        bias_ptrs = bias_ptr + offs_n[None, :]
+        bias = tl.load(bias_ptrs, mask=offs_n[None, :] < N, other=0.0)
+        accumulator += bias
+
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+def int8_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    out_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """INT8 matrix multiplication: A @ B^T.
+
+    Args:
+        a: INT8 activations [..., K].
+        a_s: Activation scales [..., K//block_size].
+        b: INT8 weights [N, K].
+        b_s: Weight scales [N//block_size, K//block_size].
+        out_dtype: Output dtype (default: float16).
+
+    Returns:
+        Result tensor [..., N].
+    """
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a_s.is_contiguous() and b_s.is_contiguous()
+    assert b.dim() == 2
+
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.shape[0]
+
+    assert b.size(1) == K
+
+    c = a.new_empty(*a.size()[:-1], N, dtype=out_dtype)
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    int8_gemm_kernel[grid](
+        a, b, c, a_s, b_s, M, N, K,
+        BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128
+    )
+    return c
+
+
+def int8_addmm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """INT8 matrix multiplication with fused bias addition: A @ B^T + bias.
+
+    Args:
+        a: INT8 activations [..., K].
+        a_s: Activation scales [..., K//block_size].
+        b: INT8 weights [N, K].
+        b_s: Weight scales [N//block_size, K//block_size].
+        bias: Optional bias vector [N].
+        out_dtype: Output dtype (default: float16).
+
+    Returns:
+        Result tensor [..., N].
+    """
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a_s.is_contiguous() and b_s.is_contiguous()
+    assert b.dim() == 2
+
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.shape[0]
+
+    assert b.size(1) == K
+
+    c = a.new_empty(*a.size()[:-1], N, dtype=out_dtype)
+
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.is_contiguous()
+        assert bias.dim() == 1 and bias.size(0) == N
+        bias_ptr = bias
+    else:
+        bias_ptr = c  # Dummy pointer
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    int8_gemm_addmm_kernel[grid](
+        a, b, c, bias_ptr, a_s, b_s, M, N, K,
+        HAS_BIAS=has_bias,
+        BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128
+    )
+    return c
