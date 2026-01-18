@@ -351,212 +351,153 @@ def scaled_mm_mxfp8(
 INT8_BLOCK_SIZE = 128
 
 
-def quantize_int8_blockwise(
+def quantize_int8(
     x: torch.Tensor,
     block_size: int = 128,
+    is_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Block-wise INT8 activation quantization.
-
-    Quantizes along the last dimension with the given block size.
+    """Block-wise INT8 quantization.
 
     Args:
-        x: Input tensor, last dim must be divisible by block_size
-        block_size: Quantization block size (default 128)
+        x: Input tensor. For weights (is_weight=True), must be 2D with both
+           dims divisible by block_size. For activations, last dim must be
+           divisible by block_size.
+        block_size: Quantization block size (default 128).
+        is_weight: If True, use 2D blocking for weights. If False, use 1D
+                   blocking along last dimension for activations.
 
     Returns:
         Tuple of (qdata, scale):
             - qdata: Quantized INT8 tensor with same shape as input
-            - scale: Per-block scaling factors, shape [..., K//block_size]
+            - scale: Per-block scaling factors
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.size(-1) % block_size == 0, (
-        f"Last dimension {x.size(-1)} must be divisible by block_size {block_size}"
-    )
 
-    K = x.size(-1)
-    batch_shape = x.shape[:-1]
+    if is_weight:
+        # 2D block-wise quantization for weights
+        assert x.dim() == 2, f"Weight must be 2D, got {x.dim()}D"
+        M, N = x.shape
+        assert M % block_size == 0, f"M={M} must be divisible by block_size={block_size}"
+        assert N % block_size == 0, f"N={N} must be divisible by block_size={block_size}"
 
-    # Reshape to blocks: [..., K//bs, bs]
-    x_blocked = x.reshape(*batch_shape, K // block_size, block_size)
+        # Reshape to 2D blocks: (M//bs, bs, N//bs, bs) -> (M//bs, N//bs, bs, bs)
+        x_blocked = x.reshape(M // block_size, block_size, N // block_size, block_size)
+        x_blocked = x_blocked.permute(0, 2, 1, 3)
 
-    # Compute per-block max absolute value
-    amax = x_blocked.abs().amax(dim=-1)
+        # Compute per-block max absolute value
+        amax = x_blocked.abs().amax(dim=(-2, -1))
 
-    # Compute scale (avoid division by zero)
-    scale = amax / 127.0
-    scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
+        # Compute scale
+        scale = amax / 127.0
+        scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
 
-    # Quantize
-    scale_broadcast = scale.unsqueeze(-1)
-    x_scaled = x_blocked / scale_broadcast
-    x_clamped = x_scaled.clamp(-127.0, 127.0)
-    qdata = x_clamped.round().to(torch.int8).reshape(x.shape)
+        # Quantize
+        scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)
+        x_scaled = x_blocked / scale_broadcast
+        x_clamped = x_scaled.clamp(-127.0, 127.0)
+        qdata = x_clamped.round().to(torch.int8)
+
+        # Reshape back to (M, N)
+        qdata = qdata.permute(0, 2, 1, 3).reshape(M, N)
+    else:
+        # 1D block-wise quantization for activations
+        assert x.size(-1) % block_size == 0, (
+            f"Last dimension {x.size(-1)} must be divisible by block_size {block_size}"
+        )
+
+        K = x.size(-1)
+        batch_shape = x.shape[:-1]
+
+        # Reshape to blocks: [..., K//bs, bs]
+        x_blocked = x.reshape(*batch_shape, K // block_size, block_size)
+
+        # Compute per-block max absolute value
+        amax = x_blocked.abs().amax(dim=-1)
+
+        # Compute scale
+        scale = amax / 127.0
+        scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
+
+        # Quantize
+        scale_broadcast = scale.unsqueeze(-1)
+        x_scaled = x_blocked / scale_broadcast
+        x_clamped = x_scaled.clamp(-127.0, 127.0)
+        qdata = x_clamped.round().to(torch.int8).reshape(x.shape)
 
     return qdata, scale.to(torch.float32)
 
 
-def dequantize_int8_blockwise(
+def dequantize_int8(
     qx: torch.Tensor,
     scale: torch.Tensor,
     block_size: int = 128,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Block-wise INT8 activation dequantization.
+    """Block-wise INT8 dequantization.
+
+    Automatically detects activation vs weight based on scale tensor shape:
+    - 2D scale = weight (2D blocking)
+    - Other = activation (1D blocking along last dim)
 
     Args:
-        qx: Quantized INT8 tensor
-        scale: Per-block scaling factors
-        block_size: Block size used for quantization
-        output_dtype: Target output dtype
+        qx: Quantized INT8 tensor.
+        scale: Per-block scaling factors.
+        block_size: Block size used for quantization.
+        output_dtype: Target output dtype.
 
     Returns:
-        Dequantized tensor with original shape
+        Dequantized tensor with original shape.
     """
-    K = qx.size(-1)
-    batch_shape = qx.shape[:-1]
+    is_weight = (scale.dim() == 2 and qx.dim() == 2)
 
-    # Reshape to blocks
-    qx_blocked = qx.reshape(*batch_shape, K // block_size, block_size)
+    if is_weight:
+        # 2D block-wise dequantization for weights
+        M, N = qx.shape
+        qx_blocked = qx.reshape(M // block_size, block_size, N // block_size, block_size)
+        qx_blocked = qx_blocked.permute(0, 2, 1, 3)
 
-    # Dequantize
-    scale_broadcast = scale.unsqueeze(-1)
-    dequant = qx_blocked.to(output_dtype) * scale_broadcast.to(output_dtype)
+        scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1).to(output_dtype)
+        dequant = qx_blocked.to(output_dtype) * scale_broadcast
 
-    return dequant.reshape(qx.shape)
+        return dequant.permute(0, 2, 1, 3).reshape(M, N)
+    else:
+        # 1D block-wise dequantization for activations
+        K = qx.size(-1)
+        batch_shape = qx.shape[:-1]
 
+        qx_blocked = qx.reshape(*batch_shape, K // block_size, block_size)
+        scale_broadcast = scale.unsqueeze(-1)
+        dequant = qx_blocked.to(output_dtype) * scale_broadcast.to(output_dtype)
 
-def quantize_int8_weight(
-    x: torch.Tensor,
-    block_size: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """2D block-wise INT8 weight quantization.
-
-    Quantizes a 2D weight tensor with blocks along both dimensions.
-
-    Args:
-        x: 2D weight tensor (M, N), both dims must be divisible by block_size
-        block_size: Quantization block size (default 128)
-
-    Returns:
-        Tuple of (qdata, scale):
-            - qdata: Quantized INT8 tensor (M, N)
-            - scale: Per-block scaling factors (M//block_size, N//block_size)
-    """
-    assert x.dim() == 2, f"Weight must be 2D, got {x.dim()}D"
-    assert x.is_contiguous(), "Weight tensor must be contiguous"
-
-    M, N = x.shape
-    assert M % block_size == 0, f"M={M} must be divisible by block_size={block_size}"
-    assert N % block_size == 0, f"N={N} must be divisible by block_size={block_size}"
-
-    # Reshape to 2D blocks: (M//bs, bs, N//bs, bs) -> (M//bs, N//bs, bs, bs)
-    x_blocked = x.reshape(M // block_size, block_size, N // block_size, block_size)
-    x_blocked = x_blocked.permute(0, 2, 1, 3)  # (M//bs, N//bs, bs, bs)
-
-    # Compute per-block max absolute value
-    amax = x_blocked.abs().amax(dim=(-2, -1))  # (M//bs, N//bs)
-
-    # Compute scale
-    scale = amax / 127.0
-    scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
-
-    # Quantize
-    scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)  # (M//bs, N//bs, 1, 1)
-    x_scaled = x_blocked / scale_broadcast
-    x_clamped = x_scaled.clamp(-127.0, 127.0)
-    qdata = x_clamped.round().to(torch.int8)
-
-    # Reshape back to (M, N)
-    qdata = qdata.permute(0, 2, 1, 3).reshape(M, N)
-
-    return qdata, scale.to(torch.float32)
+        return dequant.reshape(qx.shape)
 
 
-def dequantize_int8_weight(
-    qx: torch.Tensor,
-    scale: torch.Tensor,
-    block_size: int = 128,
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """2D block-wise INT8 weight dequantization.
-
-    Args:
-        qx: Quantized INT8 tensor (M, N)
-        scale: Per-block scaling factors (M//block_size, N//block_size)
-        block_size: Block size used for quantization
-        output_dtype: Target output dtype
-
-    Returns:
-        Dequantized tensor (M, N)
-    """
-    M, N = qx.shape
-
-    # Reshape to 2D blocks
-    qx_blocked = qx.reshape(M // block_size, block_size, N // block_size, block_size)
-    qx_blocked = qx_blocked.permute(0, 2, 1, 3)  # (M//bs, N//bs, bs, bs)
-
-    # Dequantize
-    scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1).to(output_dtype)
-    dequant = qx_blocked.to(output_dtype) * scale_broadcast
-
-    # Reshape back
-    return dequant.permute(0, 2, 1, 3).reshape(M, N)
-
-
-def int8_gemm(
+def scaled_mm_int8(
     a: torch.Tensor,
-    a_s: torch.Tensor,
     b: torch.Tensor,
-    b_s: torch.Tensor,
-    out_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    """INT8 matrix multiplication (fallback using dequantization).
-
-    Computes: C = A @ B^T
-
-    Args:
-        a: INT8 activations [..., K].
-        a_s: Activation scales [..., K//block_size].
-        b: INT8 weights [N, K].
-        b_s: Weight scales [N//block_size, K//block_size].
-        out_dtype: Output dtype (default: float16).
-
-    Returns:
-        Result tensor [..., N].
-    """
-    # Fallback: dequantize both operands and use standard matmul
-    a_fp = dequantize_int8_blockwise(a, a_s, INT8_BLOCK_SIZE, torch.float32)
-    b_fp = dequantize_int8_weight(b, b_s, INT8_BLOCK_SIZE, torch.float32)
-    result = torch.nn.functional.linear(a_fp, b_fp)
-    return result.to(out_dtype) if out_dtype else result
-
-
-def int8_addmm(
-    a: torch.Tensor,
-    a_s: torch.Tensor,
-    b: torch.Tensor,
-    b_s: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
     bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.float16,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """INT8 matrix multiplication with bias (fallback using dequantization).
+    """INT8 matrix multiplication with block-wise scaling.
 
-    Computes: C = A @ B^T + bias
+    Computes: C = A @ B^T + bias (linear semantics)
 
     Args:
         a: INT8 activations [..., K].
-        a_s: Activation scales [..., K//block_size].
         b: INT8 weights [N, K].
-        b_s: Weight scales [N//block_size, K//block_size].
+        scale_a: Activation scales [..., K//block_size].
+        scale_b: Weight scales [N//block_size, K//block_size].
         bias: Optional bias vector [N].
-        out_dtype: Output dtype (default: float16).
+        out_dtype: Output dtype.
 
     Returns:
         Result tensor [..., N].
     """
     # Fallback: dequantize both operands and use standard matmul
-    a_fp = dequantize_int8_blockwise(a, a_s, INT8_BLOCK_SIZE, torch.float32)
-    b_fp = dequantize_int8_weight(b, b_s, INT8_BLOCK_SIZE, torch.float32)
+    a_fp = dequantize_int8(a, scale_a, INT8_BLOCK_SIZE, torch.float32)
+    b_fp = dequantize_int8(b, scale_b, INT8_BLOCK_SIZE, torch.float32)
     result = torch.nn.functional.linear(a_fp, b_fp, bias)
     return result.to(out_dtype) if out_dtype else result
 

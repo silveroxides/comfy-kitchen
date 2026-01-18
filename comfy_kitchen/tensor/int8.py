@@ -80,26 +80,13 @@ class BlockWiseINT8Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
 
-        # Import quantization functions
-        # Try Triton first, fall back to eager
+        # Import quantization function - Try Triton first, fall back to eager
         try:
-            from comfy_kitchen.backends.triton.quantization import (
-                quantize_int8_blockwise as triton_quant_act,
-                quantize_int8_weight as triton_quant_weight,
-            )
-            if is_weight:
-                qdata, scale = triton_quant_weight(tensor, block_size=block_size)
-            else:
-                qdata, scale = triton_quant_act(tensor, block_size=block_size)
+            from comfy_kitchen.backends.triton.quantization import quantize_int8
+            qdata, scale = quantize_int8(tensor, block_size=block_size, is_weight=is_weight)
         except (ImportError, RuntimeError):
-            from comfy_kitchen.backends.eager.quantization import (
-                quantize_int8_blockwise as eager_quant_act,
-                quantize_int8_weight as eager_quant_weight,
-            )
-            if is_weight:
-                qdata, scale = eager_quant_weight(tensor, block_size=block_size)
-            else:
-                qdata, scale = eager_quant_act(tensor, block_size=block_size)
+            from comfy_kitchen.backends.eager.quantization import quantize_int8
+            qdata, scale = quantize_int8(tensor, block_size=block_size, is_weight=is_weight)
 
         params = cls.Params(
             scale=scale,
@@ -123,39 +110,19 @@ class BlockWiseINT8Layout(QuantizedLayout):
         """
         # Try Triton first, fall back to eager
         try:
-            from comfy_kitchen.backends.triton.quantization import (
-                dequantize_int8_blockwise as triton_dequant_act,
-                dequantize_int8_weight as triton_dequant_weight,
+            from comfy_kitchen.backends.triton.quantization import dequantize_int8
+            return dequantize_int8(
+                qdata, params.scale,
+                block_size=params.block_size,
+                output_dtype=params.orig_dtype,
             )
-            if params.is_weight:
-                return triton_dequant_weight(
-                    qdata, params.scale,
-                    block_size=params.block_size,
-                    output_dtype=params.orig_dtype,
-                )
-            else:
-                return triton_dequant_act(
-                    qdata, params.scale,
-                    block_size=params.block_size,
-                    output_dtype=params.orig_dtype,
-                )
         except (ImportError, RuntimeError):
-            from comfy_kitchen.backends.eager.quantization import (
-                dequantize_int8_blockwise as eager_dequant_act,
-                dequantize_int8_weight as eager_dequant_weight,
+            from comfy_kitchen.backends.eager.quantization import dequantize_int8
+            return dequantize_int8(
+                qdata, params.scale,
+                block_size=params.block_size,
+                output_dtype=params.orig_dtype,
             )
-            if params.is_weight:
-                return eager_dequant_weight(
-                    qdata, params.scale,
-                    block_size=params.block_size,
-                    output_dtype=params.orig_dtype,
-                )
-            else:
-                return eager_dequant_act(
-                    qdata, params.scale,
-                    block_size=params.block_size,
-                    output_dtype=params.orig_dtype,
-                )
 
     @classmethod
     def get_plain_tensors(cls, qtensor: QuantizedTensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -213,31 +180,22 @@ def _int8_scaled_mm(
     """
     # Try Triton kernel first
     try:
-        from comfy_kitchen.backends.triton.quantization import int8_addmm, int8_gemm
-        if bias is not None:
-            return int8_addmm(input_qdata, scale_a, weight_qdata, scale_b, bias, out_dtype or torch.float16)
-        else:
-            return int8_gemm(input_qdata, scale_a, weight_qdata, scale_b, out_dtype or torch.float16)
+        from comfy_kitchen.backends.triton.quantization import scaled_mm_int8
+        return scaled_mm_int8(input_qdata, weight_qdata, scale_a, scale_b, bias, out_dtype or torch.bfloat16)
     except (ImportError, RuntimeError):
         pass
 
     # Fallback to eager backend
     try:
-        from comfy_kitchen.backends.eager.quantization import int8_addmm as eager_int8_addmm, int8_gemm as eager_int8_gemm
-        if bias is not None:
-            return eager_int8_addmm(input_qdata, scale_a, weight_qdata, scale_b, bias, out_dtype or torch.float16)
-        else:
-            return eager_int8_gemm(input_qdata, scale_a, weight_qdata, scale_b, out_dtype or torch.float16)
+        from comfy_kitchen.backends.eager.quantization import scaled_mm_int8
+        return scaled_mm_int8(input_qdata, weight_qdata, scale_a, scale_b, bias, out_dtype or torch.bfloat16)
     except (ImportError, RuntimeError):
         pass
 
     # Final fallback: dequantize and use standard matmul
-    from comfy_kitchen.backends.eager.quantization import (
-        dequantize_int8_blockwise,
-        dequantize_int8_weight,
-    )
-    a_fp = dequantize_int8_blockwise(input_qdata, scale_a, 128, out_dtype or torch.bfloat16)
-    b_fp = dequantize_int8_weight(weight_qdata, scale_b, 128, out_dtype or torch.bfloat16)
+    from comfy_kitchen.backends.eager.quantization import dequantize_int8
+    a_fp = dequantize_int8(input_qdata, scale_a, 128, out_dtype or torch.bfloat16)
+    b_fp = dequantize_int8(weight_qdata, scale_b, 128, out_dtype or torch.bfloat16)
     result = torch.nn.functional.linear(a_fp, b_fp, bias)
     return result.to(out_dtype) if out_dtype else result
 
