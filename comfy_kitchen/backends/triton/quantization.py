@@ -1079,3 +1079,187 @@ def scaled_mm_int8(
         BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128
     )
     return c
+
+
+# =============================================================================
+# INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
+# =============================================================================
+# Simpler approach: single scale per tensor + per-row activation scaling.
+# Uses torch._int_mm compatible format.
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
+    ],
+    key=['QUANTIZED_M', 'N', 'K', 'stride_bk'],
+)
+@triton.jit
+def mm_int8_tensorwise_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    QUANTIZED_M,
+):
+    """INT8 GEMM kernel: C[M,N] = A[M,K] @ B[K,N].
+
+    Accumulates in int32. Output is int32 for later scaling.
+    Based on dxqb/OneTrainer Triton kernel.
+    """
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
+        b_mask = (offs_bn[None, :] < N) & (offs_k[:, None] < K - k * BLOCK_SIZE_K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def mm_int8_triton(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
+
+    Uses autotuned Triton kernel. Output is int32 for later dequantization.
+
+    Args:
+        a: INT8 tensor [M, K].
+        b: INT8 tensor [K, N].
+
+    Returns:
+        INT32 tensor [M, N] with accumulated dot products.
+    """
+    assert a.dtype == torch.int8 and b.dtype == torch.int8
+    assert a.dim() == 2 and b.dim() == 2
+    assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
+
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.int32)
+
+    grid = lambda META: (
+        triton.cdiv(N, META['BLOCK_SIZE_N']),
+        triton.cdiv(M, META['BLOCK_SIZE_M'])
+    )
+    mm_int8_tensorwise_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        QUANTIZED_M=M // 64,
+    )
+    return c
+
+
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale.
+
+    Args:
+        x: Input tensor of any shape.
+
+    Returns:
+        Tuple of (quantized_int8, scale):
+            - quantized_int8: INT8 tensor with same shape
+            - scale: Scalar float32 tensor
+    """
+    abs_max = x.abs().max()
+    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    q = (x.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations).
+
+    Args:
+        x: Input tensor [..., K] where quantization is per-row.
+
+    Returns:
+        Tuple of (quantized_int8, scales):
+            - quantized_int8: INT8 tensor with same shape
+            - scales: Float32 tensor [..., 1] with per-row scales
+    """
+    abs_max = x.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    q = (x.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale.
+
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale tensor (scalar or broadcastable).
+
+    Returns:
+        Dequantized float tensor.
+    """
+    return q.float() * scale
+
+
+def int8_linear_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear layer using Triton mm_int8 kernel.
+
+    Quantizes x dynamically per-row, uses tensorwise weight scale.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Quantize input per-row
+    x_8, x_scale = quantize_int8_rowwise(x_2d)
+
+    # Compute: x_8 @ weight.T using Triton kernel
+    # weight is [N, K], we need [K, N] for matmul so transpose
+    result = mm_int8_triton(x_8, weight.T.contiguous())
+
+    # Scale back: result * (weight_scale * x_scale)
+    result = result.float() * (weight_scale * x_scale)
+
+    if bias is not None:
+        result = result + bias.to(result.dtype)
+
+    result = result.to(out_dtype)
+    return result.reshape(*orig_shape[:-1], weight.shape[0])
+
