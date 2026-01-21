@@ -695,4 +695,167 @@ def cublas_gemm_int8(
 
     return c
 
+
+def _build_constraints():
+    from comfy_kitchen.constraints import (
+        FunctionConstraints,
+        ParamConstraint,
+        ExactDims,
+        DivisibleBy,
+    )
+
+    cuda_devices = frozenset([torch.device("cuda")])
+
+    constraints = {
+        "quantize_nvfp4": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 9),
+        ),
+        "quantize_per_tensor_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
+                ),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 9),
+        ),
+        "dequantize_per_tensor_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 9),
+        ),
+        "quantize_mxfp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(10, 0),
+        ),
+        "apply_rope": FunctionConstraints(
+            params={
+                "xq": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "xk": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "apply_rope1": FunctionConstraints(
+            params={
+                "xq": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "xk": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "cublas_gemm_int8": FunctionConstraints(
+            params={
+                "a": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "c": ParamConstraint(
+                    dtypes=frozenset({torch.int32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        )
+    }
+
+    if _CUBLASLT_AVAILABLE:
+        constraints["scaled_mm_nvfp4"] = FunctionConstraints(
+            params={
+                "a": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=16)),
+                ),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=16)),
+                ),
+                "tensor_scale_a": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                ),
+                "tensor_scale_b": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                ),
+                "block_scale_a": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                ),
+                "block_scale_b": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                ),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(10, 0),
+        )
+
+    return constraints
+
+
+def _register():
+    """Register CUDA backend with the global registry."""
+    from comfy_kitchen.registry import registry
+
+    if not _EXT_AVAILABLE:
+        registry.mark_unavailable("cuda", _EXT_ERROR)
+        return
+
+    if not torch.cuda.is_available():
+        registry.mark_unavailable("cuda", "CUDA not available on this system")
+        return
+
+    registry.register(
+        name="cuda",
+        module=__import__(__name__, fromlist=__all__),
+        capabilities=_build_constraints(),
+    )
+
+
 _register()
