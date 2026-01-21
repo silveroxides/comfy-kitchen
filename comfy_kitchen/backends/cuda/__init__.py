@@ -28,6 +28,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "scaled_mm_nvfp4",
+    "cublas_gemm_int8",
 ]
 
 
@@ -592,6 +593,24 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
+        "cublas_gemm_int8": FunctionConstraints(
+            params={
+                "a": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "c": ParamConstraint(
+                    dtypes=frozenset({torch.int32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        )
     }
 
     if _CUBLASLT_AVAILABLE:
@@ -628,23 +647,52 @@ def _build_constraints() -> dict:
     return constraints
 
 
-def _register():
-    """Register CUDA backend with the global registry."""
-    from comfy_kitchen.registry import registry
 
-    if not _EXT_AVAILABLE:
-        registry.mark_unavailable("cuda", _EXT_ERROR)
-        return
+def cublas_gemm_int8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """INT8 Matrix Multiplication using cuBLASLt.
 
-    if not torch.cuda.is_available():
-        registry.mark_unavailable("cuda", "CUDA not available on this system")
-        return
+    Computes C = A @ B (where A, B are INT8, C is INT32).
+    
+    Args:
+        a: Input tensor A [M, K] (int8)
+        b: Input tensor B [K, N] (int8)
+        c: Optional output tensor C [M, N] (int32). If None, will be allocated.
 
-    registry.register(
-        name="cuda",
-        module=__import__(__name__, fromlist=__all__),
-        capabilities=_build_constraints(),
+    Returns:
+        Result tensor C (int32)
+    """
+    assert a.dtype == torch.int8, "A must be int8"
+    assert b.dtype == torch.int8, "B must be int8"
+    assert a.is_contiguous(), "A must be contiguous"
+    assert b.is_contiguous(), "B must be contiguous"
+
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b, f"K dimension mismatch: {K} != {K_b}"
+
+    if c is None:
+        c = torch.empty((M, N), dtype=torch.int32, device=a.device)
+    else:
+        assert c.dtype == torch.int32, "C must be int32"
+        assert c.size() == (M, N), f"C shape mismatch: expected ({M}, {N}), got {c.shape}"
+        if not c.is_contiguous():
+            c = c.contiguous()
+
+    stream_ptr = torch.cuda.current_stream(a.device).cuda_stream
+    workspace = get_cublas_workspace()
+
+    _C.cublas_gemm_int8(
+        _wrap_for_dlpack(a),
+        _wrap_for_dlpack(b),
+        _wrap_for_dlpack(c),
+        _wrap_for_dlpack(workspace),
+        stream_ptr,
     )
 
+    return c
 
 _register()
