@@ -742,8 +742,6 @@ def quantize_mxfp8(
     swizzled_scales = swizzled_scales.view(torch.float8_e8m0fnu)
 
     return output, swizzled_scales
-
-
 # =============================================================================
 # INT8 Block-wise Quantization
 # =============================================================================
