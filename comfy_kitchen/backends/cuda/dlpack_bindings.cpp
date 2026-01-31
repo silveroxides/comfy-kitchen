@@ -42,7 +42,17 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
 
 // Forward declarations of CUDA kernel wrappers
 extern "C" {
-    void launch_quantize_fp8_kernel(const void* input, void* output, 
+    // Nunchaku Batched GEMM declarations
+    size_t nunchaku_gemm_batched_workspace_size(int batch, int M, int N, int K, int dtype_code);
+    
+    void launch_nunchaku_gemm_batched_kernel(
+        const void* a, const void* b, void* out, void* workspace, size_t workspace_size,
+        int batch, int M, int N, int K,
+        int dtype_code,
+        cudaStream_t stream
+    );
+
+    void launch_quantize_fp8_kernel(const void* input, void* output,
                                     const void* scale, int64_t numel,
                                     int input_dtype_code, int output_dtype_code,
                                     cudaStream_t stream);
@@ -138,6 +148,23 @@ extern "C" {
         int64_t K,
         void* workspace_ptr,
         int64_t workspace_size,
+        cudaStream_t stream);
+
+    void launch_nunchaku_gemm_w4a4_kernel(
+        const void* input,
+        const void* weight,
+        const void* wscales,
+        const void* ascales,
+        const void* bias,
+        void* output,
+        int M,
+        int N,
+        int K,
+        int input_dtype_code,
+        int weight_dtype_code,
+        int wscales_dtype_code,
+        int ascales_dtype_code,
+        int bias_dtype_code,
         cudaStream_t stream);
 }
 
@@ -606,6 +633,109 @@ NB_MODULE(_C, m) {
           nb::arg("c"),
           nb::arg("workspace"),
           nb::arg("stream_ptr"));
+
+    // Helper to get workspace size for batched GEMM
+    m.def("nunchaku_gemm_batched_workspace_size", [](
+            int batch, int M, int N, int K, int dtype_code
+          ) {
+            return nunchaku_gemm_batched_workspace_size(batch, M, N, K, dtype_code);
+          },
+          "Get workspace size for Nunchaku Batched GEMM",
+          nb::arg("batch"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("dtype_code")
+    );
+
+    m.def("nunchaku_gemm_batched", [](
+            nb::ndarray<nb::device::cuda> a,
+            nb::ndarray<nb::device::cuda> b,
+            nb::ndarray<nb::device::cuda> out,
+            nb::ndarray<nb::device::cuda> workspace,
+            uintptr_t stream_ptr
+          ) {
+            // Check shapes
+            // a: [batch, M, K]
+            // b: [batch, N, K]
+            // out: [batch, M, N]
+            
+            if (a.ndim() != 3 || b.ndim() != 3 || out.ndim() != 3) {
+                throw std::runtime_error("Inputs must be 3D tensors [batch, M, K]");
+            }
+            
+            int64_t batch = a.shape(0);
+            int64_t M = a.shape(1);
+            int64_t K = a.shape(2);
+            int64_t N = b.shape(1);
+            
+            if (b.shape(0) != batch || b.shape(2) != K) throw std::runtime_error("Dimension mismatch in b");
+            if (out.shape(0) != batch || out.shape(1) != M || out.shape(2) != N) throw std::runtime_error("Dimension mismatch in out");
+            
+            int dtype_code = map_dtype_to_code(a.dtype());
+            
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            
+            launch_nunchaku_gemm_batched_kernel(
+                a.data(), b.data(), out.data(), workspace.data(), workspace.size(),
+                batch, M, N, K, dtype_code, stream
+            );
+          },
+          "Nunchaku Batched GEMM (FP16 inputs, FP32 output)",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("out"),
+          nb::arg("workspace"),
+          nb::arg("stream_ptr")
+    );
+
+    m.def("nunchaku_gemm_w4a4", [](
+            nb::ndarray<nb::device::cuda> input,
+            nb::ndarray<nb::device::cuda> weight,
+            nb::ndarray<nb::device::cuda> wscales,
+            nb::object ascales_obj,
+            nb::object bias_obj,
+            nb::ndarray<nb::device::cuda> output,
+            uintptr_t stream_ptr
+          ) {
+            int64_t M = input.shape(0);
+            int64_t K = input.shape(1);
+            int64_t N = weight.shape(0); // Assuming standard [N, K] or similar, need to verify Nunchaku layout
+
+            // Map dtypes
+            int input_code = map_dtype_to_code(input.dtype());
+            int weight_code = map_dtype_to_code(weight.dtype());
+            int wscales_code = map_dtype_to_code(wscales.dtype());
+            int ascales_code = -1;
+            int bias_code = -1;
+            
+            const void* ascales_ptr = nullptr;
+            if (!ascales_obj.is_none()) {
+                auto ascales = nb::cast<nb::ndarray<nb::device::cuda>>(ascales_obj);
+                ascales_ptr = ascales.data();
+                ascales_code = map_dtype_to_code(ascales.dtype());
+            }
+
+            const void* bias_ptr = nullptr;
+            if (!bias_obj.is_none()) {
+                auto bias = nb::cast<nb::ndarray<nb::device::cuda>>(bias_obj);
+                bias_ptr = bias.data();
+                bias_code = map_dtype_to_code(bias.dtype());
+            }
+
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            launch_nunchaku_gemm_w4a4_kernel(
+                input.data(), weight.data(), wscales.data(), ascales_ptr, bias_ptr, output.data(),
+                M, N, K,
+                input_code, weight_code, wscales_code, ascales_code, bias_code,
+                stream
+            );
+          },
+          "Nunchaku W4A4 GEMM",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("wscales"),
+          nb::arg("ascales"),
+          nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("stream_ptr")
+    );
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();

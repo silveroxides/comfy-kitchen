@@ -107,7 +107,27 @@ set(CUDA_SOURCES
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
     ops/apply_rope.cu
+    ops/nunchaku/nunchaku_ops.cu
+    ops/nunchaku/activation_kernels.cu
+    ops/nunchaku/layernorm_kernels.cu
+    ops/nunchaku/gemm_batched.cu
 )
+
+# Configure CUTLASS to be header-only and disable its own architecture flags
+set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library" FORCE)
+set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Disable CUTLASS tests" FORCE)
+set(CUTLASS_ENABLE_EXAMPLES OFF CACHE BOOL "Disable CUTLASS examples" FORCE)
+set(CUTLASS_ENABLE_TOOLS OFF CACHE BOOL "Disable CUTLASS tools" FORCE)
+set(CUTLASS_ENABLE_LIBRARY OFF CACHE BOOL "Disable CUTLASS library build" FORCE)
+set(CUTLASS_ENABLE_PERFORMANCE OFF CACHE BOOL "Disable CUTLASS performance tests" FORCE)
+
+include(FetchContent)
+FetchContent_Declare(
+  cutlass
+  GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+  GIT_TAG        v3.5.0
+)
+FetchContent_MakeAvailable(cutlass)
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
@@ -138,9 +158,14 @@ target_compile_options(_C PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>
 )
 
+if(WIN32)
+    target_compile_definitions(_C PRIVATE NOMINMAX)
+endif()
+
 # Include directories
 target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ops/nunchaku
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
@@ -148,6 +173,7 @@ target_include_directories(_C PRIVATE
 # Note: cuBLASLt is loaded dynamically at runtime via dlopen/LoadLibrary
 target_link_libraries(_C PRIVATE
     CUDA::cudart_static
+    nvidia::cutlass::cutlass
 )
 
 # On Windows, static cudart requires additional system libraries
