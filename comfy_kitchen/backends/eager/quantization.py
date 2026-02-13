@@ -835,7 +835,7 @@ def _op_scaled_mm_mxfp8_fake(
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
-    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
+    Uses torch.int8_mm (cuBLASLt on CUDA). Output is int32.
 
     Args:
         a: INT8 tensor [M, K].
@@ -847,7 +847,7 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8 and b.dtype == torch.int8
     assert a.dim() == 2 and b.dim() == 2
     assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
-    return torch._int_mm(a, b)
+    return torch.int8_mm(a, b)
 
 
 def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -904,9 +904,10 @@ def int8_linear(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """INT8 linear layer using torch._int_mm.
+    """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
     Quantizes x dynamically per-row, uses tensorwise weight scale.
+    Processes scaling in chunks to avoid materializing large float32 tensors.
 
     Args:
         x: Input tensor [..., K].
@@ -924,16 +925,34 @@ def int8_linear(
     # Quantize input per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
-    # Compute: x_8 @ weight.T using torch._int_mm
+    # Compute: x_8 @ weight.T using torch.int8_mm (public API)
     # weight is [N, K], we need [K, N] for matmul so transpose
-    result = torch._int_mm(x_8, weight.T.contiguous())
+    result = torch.int8_mm(x_8, weight.T.contiguous())
 
-    # Scale back: result * (weight_scale * x_scale)
-    result = result.float() * (weight_scale * x_scale)
+    # Scale back efficiently: result * (weight_scale * x_scale)
+    # Process in chunks to avoid materializing large float32 tensor
+    # which causes OOM for large models
+
+    M, N = result.shape
+    chunk_size = max(1, min(M, 256 * 1024 * 1024 // (N * 4)))  # Estimate safe chunk size
+
+    scaled_parts = []
+    for i in range(0, M, chunk_size):
+        end_i = min(i + chunk_size, M)
+        chunk = result[i:end_i].float()
+
+        # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
+        chunk_scales = (weight_scale * x_scale[i:end_i])
+        chunk_scaled = chunk * chunk_scales
+
+        # Convert to output dtype immediately to free memory
+        chunk_scaled = chunk_scaled.to(out_dtype)
+        scaled_parts.append(chunk_scaled)
+
+    result = torch.cat(scaled_parts, dim=0)
 
     if bias is not None:
-        result = result + bias.to(result.dtype)
+        result = result + bias.to(device=result.device, dtype=result.dtype)
 
-    result = result.to(out_dtype)
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
