@@ -835,7 +835,7 @@ def _op_scaled_mm_mxfp8_fake(
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
-    Uses torch.int8_mm (cuBLASLt on CUDA). Output is int32.
+    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
 
     Args:
         a: INT8 tensor [M, K].
@@ -847,7 +847,10 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8 and b.dtype == torch.int8
     assert a.dim() == 2 and b.dim() == 2
     assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
-    return torch.int8_mm(a, b)
+    if hasattr(torch, "int8_mm"):
+        return torch.int8_mm(a, b)
+    return torch._int_mm(a, b)
+
 
 
 def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -925,9 +928,12 @@ def int8_linear(
     # Quantize input per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
-    # Compute: x_8 @ weight.T using torch.int8_mm (public API)
+    # Compute: x_8 @ weight.T using torch.int8_mm (public API) or torch._int_mm
     # weight is [N, K], we need [K, N] for matmul so transpose
-    result = torch.int8_mm(x_8, weight.T.contiguous())
+    if hasattr(torch, "int8_mm"):
+        result = torch.int8_mm(x_8, weight.T.contiguous())
+    else:
+        result = torch._int_mm(x_8, weight.T.contiguous())
 
     # Scale back efficiently: result * (weight_scale * x_scale)
     # Process in chunks to avoid materializing large float32 tensor
