@@ -27,13 +27,17 @@ __all__ = [
     # Core functions
     "apply_rope",
     "apply_rope1",
+    "dequantize_int8_simple",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "int8_linear",
     # Backend configuration
     "disable_backend",
     "enable_backend",
     "list_backends",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -234,6 +238,82 @@ def scaled_mm_mxfp8(
     return torch.ops.comfy_kitchen.scaled_mm_mxfp8(
         a, b, block_scale_a, block_scale_b, bias, dtype_code
     )
+
+
+def quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale.
+
+    Args:
+        x: Input tensor of any shape.
+
+    Returns:
+        Tuple of (quantized_int8, scale):
+            - quantized_int8: INT8 tensor with same shape
+            - scale: Scalar float32 tensor
+    """
+    return torch.ops.comfy_kitchen.quantize_int8_tensorwise(x)
+
+
+def quantize_int8_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations).
+
+    Args:
+        x: Input tensor [..., K] where quantization is per-row.
+
+    Returns:
+        Tuple of (quantized_int8, scales):
+            - quantized_int8: INT8 tensor with same shape
+            - scales: Float32 tensor [..., 1] with per-row scales
+    """
+    return torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+
+
+def dequantize_int8_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_type: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale.
+
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale tensor (scalar or broadcastable).
+        output_type: Target output dtype (float32, float16, or bfloat16)
+
+    Returns:
+        Dequantized tensor in specified output format.
+    """
+    dtype_code = DTYPE_TO_CODE[output_type]
+    return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale, dtype_code)
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
+
+    Quantizes x dynamically per-row, uses tensorwise weight scale.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(x, weight, weight_scale, bias, dtype_code)
 
 
 def apply_rope(

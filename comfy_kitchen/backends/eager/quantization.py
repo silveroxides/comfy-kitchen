@@ -962,3 +962,136 @@ def int8_linear(
 
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
+
+# =============================================================================
+# INT8 Tensor-wise Custom Ops
+# =============================================================================
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_tensorwise", mutates_args=())
+def _op_quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale.
+
+    Args:
+        x: Input tensor of any shape.
+
+    Returns:
+        Tuple of (quantized_int8, scale):
+            - quantized_int8: INT8 tensor with same shape
+            - scale: Scalar float32 tensor
+    """
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_tensorwise.register_fake
+def _op_quantize_int8_tensorwise_fake(x):
+    qdata = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    return qdata, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_rowwise", mutates_args=())
+def _op_quantize_int8_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations).
+
+    Args:
+        x: Input tensor [..., K] where quantization is per-row.
+
+    Returns:
+        Tuple of (quantized_int8, scales):
+            - quantized_int8: INT8 tensor with same shape
+            - scales: Float32 tensor [..., 1] with per-row scales
+    """
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_rowwise.register_fake
+def _op_quantize_int8_rowwise_fake(x):
+    qdata = torch.empty_like(x, dtype=torch.int8)
+    scale_shape = list(x.shape)
+    scale_shape[-1] = 1
+    scale = torch.empty(scale_shape, dtype=torch.float32, device=x.device)
+    return qdata, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
+def _op_dequantize_int8_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale.
+
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale tensor (scalar or broadcastable).
+        output_dtype_code: Target dtype code (0=float32, 1=float16, 2=bfloat16)
+
+    Returns:
+        Dequantized tensor in specified output format.
+    """
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"q": q, "scale": scale}
+    impl = registry.get_implementation("dequantize_int8_simple", kwargs=kwargs)
+    result = impl(**kwargs)
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return result.to(output_dtype)
+
+
+@_op_dequantize_int8_simple.register_fake
+def _op_dequantize_int8_simple_fake(q, scale, output_dtype_code):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty_like(q, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear", mutates_args=())
+def _op_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
+
+    Quantizes x dynamically per-row, uses tensorwise weight scale.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar weight scale.
+        bias: Optional bias [N].
+        output_dtype_code: Output dtype code (0=float32, 1=float16, 2=bfloat16)
+
+    Returns:
+        Result tensor [..., N].
+    """
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x, "weight": weight, "weight_scale": weight_scale,
+        "bias": bias, "out_dtype": out_dtype,
+    }
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_int8_linear.register_fake
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    out_shape = list(x.shape)
+    out_shape[-1] = weight.shape[0]
+    return torch.empty(out_shape, dtype=out_dtype, device=x.device)

@@ -2,10 +2,14 @@ __all__ = [
     "apply_rope",
     "apply_rope1",
     "dequantize_int8",
+    "dequantize_int8_simple",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "int8_linear",
     "quantize_int8",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -16,10 +20,14 @@ __all__ = [
 
 from .quantization import (
     dequantize_int8,
+    dequantize_int8_simple,
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    int8_linear,
     quantize_int8,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
@@ -192,6 +200,37 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
                 ),
+            },
+            default_devices=all_devices,
+        ),
+        # INT8 tensor-wise quantization
+        "quantize_int8_tensorwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_int8_simple": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=all_devices,
+        ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
             },
             default_devices=all_devices,
         ),
