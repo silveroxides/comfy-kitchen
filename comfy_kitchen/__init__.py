@@ -27,16 +27,24 @@ __all__ = [
     # Core functions
     "apply_rope",
     "apply_rope1",
+    "dequantize_int8",
+    "dequantize_int8_simple",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "int8_linear",
+    "mm_int8",
     # Backend configuration
     "disable_backend",
     "enable_backend",
     "list_backends",
+    "quantize_int8",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "scaled_mm_int8",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "set_backend_priority",
@@ -265,6 +273,119 @@ def apply_rope1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
+
+
+# =============================================================================
+# INT8 API Functions
+# =============================================================================
+
+def quantize_int8(
+    x: torch.Tensor,
+    block_size: int = 128,
+    is_weight: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise INT8 quantization.
+    
+    Args:
+        x: Input tensor.
+        block_size: Quantization block size.
+        is_weight: If True, use 2D blocking for weights.
+        
+    Returns:
+        Tuple of (qdata, scale)
+    """
+    return torch.ops.comfy_kitchen.quantize_int8(x, block_size, is_weight)
+
+
+def dequantize_int8(
+    qx: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Block-wise INT8 dequantization.
+    
+    Args:
+        qx: Quantized INT8 tensor.
+        scale: Per-block scaling factors.
+        block_size: Block size used for quantization.
+        output_dtype: Target output dtype.
+        
+    Returns:
+        Dequantized tensor.
+    """
+    dtype_code = DTYPE_TO_CODE[output_dtype]
+    return torch.ops.comfy_kitchen.dequantize_int8(qx, scale, block_size, dtype_code)
+
+
+def scaled_mm_int8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 matrix multiplication with block-wise scaling.
+    
+    Args:
+        a: INT8 activations.
+        b: INT8 weights.
+        scale_a: Activation scales.
+        scale_b: Weight scales.
+        bias: Optional bias vector.
+        out_dtype: Output dtype.
+        
+    Returns:
+        Result tensor.
+    """
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.scaled_mm_int8(a, b, scale_a, scale_b, bias, dtype_code)
+
+
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale."""
+    return torch.ops.comfy_kitchen.quantize_int8_tensorwise(x)
+
+
+def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales."""
+    return torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale."""
+    return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale)
+
+
+def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+    return torch.ops.comfy_kitchen.mm_int8(a, b)
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """INT8 linear layer dynamically quantized.
+    
+    Args:
+        x: Input tensor.
+        weight: INT8 weight tensor.
+        weight_scale: Scalar weight scale.
+        bias: Optional bias.
+        out_dtype: Output dtype.
+        
+    Returns:
+        Result tensor.
+    """
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(x, weight, weight_scale, bias, dtype_code)
 
 
 # =============================================================================

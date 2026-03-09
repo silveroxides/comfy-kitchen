@@ -423,8 +423,8 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
 
     # Try Triton kernel first
     try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear_triton
-        return int8_linear_triton(input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype)
+        from comfy_kitchen.backends.triton.quantization import int8_linear
+        return int8_linear(input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype)
     except Exception as e:
         import traceback
         err_msg = f"Triton INT8 scaled_mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
@@ -466,8 +466,8 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
     try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear_triton
-        return int8_linear_triton(input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype)
+        from comfy_kitchen.backends.triton.quantization import int8_linear
+        return int8_linear(input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype)
     except Exception as e:
         import traceback
         err_msg = f"Triton INT8 mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
@@ -505,8 +505,8 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
         input_tensor = input_tensor.dequantize()
 
     try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear_triton
-        return int8_linear_triton(input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype)
+        from comfy_kitchen.backends.triton.quantization import int8_linear
+        return int8_linear(input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype)
     except (ImportError, RuntimeError):
         pass
 

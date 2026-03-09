@@ -1624,7 +1624,7 @@ def _int8_matmul_dequant_kernel(
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
-def int8_linear_triton(
+def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
