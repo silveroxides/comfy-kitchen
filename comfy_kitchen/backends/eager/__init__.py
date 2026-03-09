@@ -1,23 +1,39 @@
 __all__ = [
     "apply_rope",
     "apply_rope1",
+    "dequantize_int8",
+    "dequantize_int8_simple",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "int8_linear",
+    "mm_int8",
+    "quantize_int8",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "scaled_mm_int8",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
 ]
 
 from .quantization import (
+    dequantize_int8,
+    dequantize_int8_simple,
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    int8_linear,
+    mm_int8,
+    quantize_int8,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
+    scaled_mm_int8,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
 )
@@ -157,6 +173,72 @@ def _build_constraints() -> dict:
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        # INT8 block-wise quantization
+        "quantize_int8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_int8": FunctionConstraints(
+            params={
+                "qx": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=all_devices,
+        ),
+        "scaled_mm_int8": FunctionConstraints(
+            params={
+                "a": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "scale_a": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "scale_b": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "quantize_int8_tensorwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_int8_simple": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=all_devices,
+        ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=all_devices,
+        ),
+        "mm_int8": FunctionConstraints(
+            params={
+                "a": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "b": ParamConstraint(dtypes=frozenset({torch.int8})),
             },
             default_devices=all_devices,
         ),

@@ -10,6 +10,8 @@ uv.lock
 
 # Virtual environments
 .venv
+venv11
+venv13
 
 # IDE
 /.vs
