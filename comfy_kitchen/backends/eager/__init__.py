@@ -52,7 +52,7 @@ def _build_constraints() -> dict:
     all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
-    return {
+    out = {
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -114,48 +114,6 @@ def _build_constraints() -> dict:
                 ),
                 "block_scale_b": ParamConstraint(
                     dtypes=frozenset({torch.float8_e4m3fn}),
-                ),
-                "out_dtype": ParamConstraint(dtypes=standard_floats),
-            },
-            default_devices=all_devices,
-        ),
-        "quantize_mxfp8": FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=standard_floats,
-                    shape_rules=(ExactDims(2),),
-                ),
-            },
-            default_devices=all_devices,
-        ),
-        "dequantize_mxfp8": FunctionConstraints(
-            params={
-                "qx": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e4m3fn}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "block_scales": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e8m0fnu}),
-                ),
-                "output_type": ParamConstraint(dtypes=standard_floats),
-            },
-            default_devices=all_devices,
-        ),
-        "scaled_mm_mxfp8": FunctionConstraints(
-            params={
-                "a": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e4m3fn}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "b": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e4m3fn}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "block_scale_a": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e8m0fnu}),
-                ),
-                "block_scale_b": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e8m0fnu}),
                 ),
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
             },
@@ -243,6 +201,51 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
     }
+
+    if hasattr(torch, "float8_e8m0fnu"):
+        out["quantize_mxfp8"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(
+                        dtypes=standard_floats,
+                        shape_rules=(ExactDims(2),),
+                    ),
+                },
+                default_devices=all_devices)
+
+        out["dequantize_mxfp8"] = FunctionConstraints(
+                params={
+                    "qx": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                    ),
+                    "output_type": ParamConstraint(dtypes=standard_floats),
+                },
+                default_devices=all_devices)
+
+        out["scaled_mm_mxfp8"] = FunctionConstraints(
+                params={
+                    "a": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "b": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scale_a": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                    ),
+                    "block_scale_b": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                    ),
+                    "out_dtype": ParamConstraint(dtypes=standard_floats),
+                },
+                default_devices=all_devices)
+
+    return out
 
 
 def _register():
