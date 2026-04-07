@@ -40,17 +40,6 @@ struct FP8LimitsTrait<__nv_fp8_e5m2> {
   static constexpr float max_inverse = 1.0 / max;
 };
 
-#if CUDA_VERSION >= 12080
-// FP4 type traits
-template <typename T>
-struct FP4LimitsTrait;
-
-template <>
-struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
-  static constexpr float max = 6.0f;
-  static constexpr float max_inverse = 1.0 / max;
-};
-
 // Vectorized half-precision loads
 #pragma nv_diag_suppress 1056
 template<typename IType>
@@ -79,6 +68,17 @@ template<typename IType>
     return reinterpret_cast<const IType*>(&vals);
 }
 #pragma nv_diag_default 1056
+
+#if CUDA_VERSION >= 12080
+// FP4 type traits
+template <typename T>
+struct FP4LimitsTrait;
+
+template <>
+struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
+  static constexpr float max = 6.0f;
+  static constexpr float max_inverse = 1.0 / max;
+};
 
 // Store 2 FP4 values (1 __nv_fp4x2)
 template<typename OType>

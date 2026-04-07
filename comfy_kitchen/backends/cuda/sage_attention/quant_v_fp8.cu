@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Fused V → FP8 E4M3 quantization with per-channel scaling.
+// Output layout [B,H,D,padded_N] with FP8 MMA 16-element permutation and
+// per-row scale.
+//
+// One thread block per (b, h, d_tile) with D_TILE=8 d-channels.  512 threads
+// cooperate along N with vectorized 128-bit loads, warp-shuffle absmax
+// reduction, forward permutation for coalesced stores, and reverse Pass 2
+// iteration for L2 cache reuse.  Pass 1 uses 4× manual unroll for
+// memory-level parallelism at low occupancy.
+
+#include "float_utils.cuh"
+#include "dtype_dispatch.cuh"
+
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+namespace {
+
+constexpr int kDTile = 8;
+constexpr int kThreads = 512;
+constexpr int kWarps = kThreads / 32;
+
+template <typename T>
+__global__ void quant_v_fp8_kernel(
+    const T* __restrict__ v,
+    __nv_fp8_e4m3* __restrict__ out,
+    float* __restrict__ scale_out,
+    int N, int padded_N, int H, int D,
+    int64_t sb, int64_t sh, int64_t sn)
+{
+    const int d_tiles = D / kDTile;
+    const int d_tile = blockIdx.x % d_tiles;
+    const int bh = blockIdx.x / d_tiles;
+    const int h = bh % H;
+    const int b = bh / H;
+    const int d0 = d_tile * kDTile;
+
+    const T* base = v + b * sb + h * sh + d0;
+
+    // ── Pass 1: per-channel absmax (threads cooperate over N) ──────────
+    float mx[kDTile];
+    #pragma unroll
+    for (int i = 0; i < kDTile; ++i) mx[i] = 0.f;
+
+    // 4× unrolled: issue 4 independent 128-bit loads per iteration
+    // so the memory controller can overlap them (critical at ≤50% occupancy).
+    int n = threadIdx.x;
+    const int N_body = N - 3 * kThreads;
+    for (; n < N_body; n += 4 * kThreads) {
+        const T* t0 = comfy::load_f16x8(base + (int64_t)n * sn);
+        const T* t1 = comfy::load_f16x8(base + (int64_t)(n + kThreads) * sn);
+        const T* t2 = comfy::load_f16x8(base + (int64_t)(n + 2 * kThreads) * sn);
+        const T* t3 = comfy::load_f16x8(base + (int64_t)(n + 3 * kThreads) * sn);
+        #pragma unroll
+        for (int di = 0; di < kDTile; ++di) {
+            float a = fabsf(static_cast<float>(t0[di]));
+            float b = fabsf(static_cast<float>(t1[di]));
+            float c = fabsf(static_cast<float>(t2[di]));
+            float d = fabsf(static_cast<float>(t3[di]));
+            mx[di] = fmaxf(mx[di], fmaxf(fmaxf(a, b), fmaxf(c, d)));
+        }
+    }
+    for (; n < N; n += kThreads) {
+        const T* tmp = comfy::load_f16x8(base + (int64_t)n * sn);
+        #pragma unroll
+        for (int di = 0; di < kDTile; ++di)
+            mx[di] = fmaxf(mx[di], fabsf(static_cast<float>(tmp[di])));
+    }
+
+    // Warp-level max reduction via shuffle
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    #pragma unroll
+    for (int di = 0; di < kDTile; ++di) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            mx[di] = fmaxf(mx[di], __shfl_xor_sync(0xffffffff, mx[di], off));
+    }
+
+    // Cross-warp reduction
+    __shared__ float warp_mx[kDTile][kWarps];
+    __shared__ float inv_sc_sh[kDTile];
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int di = 0; di < kDTile; ++di)
+            warp_mx[di][warp] = mx[di];
+    }
+    __syncthreads();
+
+    if (threadIdx.x < kDTile) {
+        float val = 0.f;
+        #pragma unroll
+        for (int w = 0; w < kWarps; ++w)
+            val = fmaxf(val, warp_mx[threadIdx.x][w]);
+
+        float sc = fmaxf(val * comfy::FP8LimitsTrait<__nv_fp8_e4m3>::max_inverse,
+                         1e-12f);
+        scale_out[(b * H + h) * D + d0 + threadIdx.x] = sc;
+        inv_sc_sh[threadIdx.x] = 1.f / sc;
+    }
+    __syncthreads();
+
+    float inv_sc[kDTile];
+    #pragma unroll
+    for (int di = 0; di < kDTile; ++di) inv_sc[di] = inv_sc_sh[di];
+
+    // ── Pass 2: quantize + permute (reverse for L2 reuse) ──────────────
+    const int64_t out_row = static_cast<int64_t>((b * H + h) * D + d0);
+
+    for (int j = padded_N - 1 - threadIdx.x; j >= 0; j -= kThreads) {
+        const int w = j & 15;
+        const int src = (j & ~15) | ((w >> 2) * 2 + ((w >> 1) & 1) * 8 + (w & 1));
+
+        float vals[kDTile];
+        if (src < N) {
+            const T* tmp = comfy::load_f16x8(base + (int64_t)src * sn);
+            #pragma unroll
+            for (int di = 0; di < kDTile; ++di)
+                vals[di] = static_cast<float>(tmp[di]) * inv_sc[di];
+        } else {
+            #pragma unroll
+            for (int di = 0; di < kDTile; ++di) vals[di] = 0.f;
+        }
+
+        #pragma unroll
+        for (int di = 0; di < kDTile; ++di)
+            out[(out_row + di) * padded_N + j] =
+                static_cast<__nv_fp8_e4m3>(vals[di]);
+    }
+}
+
+} // namespace
+
+extern "C" void launch_quant_v_fp8_kernel(
+    const void* v,
+    void* out,
+    void* scale,
+    int B, int H, int N, int D, int padded_N,
+    int64_t sb, int64_t sh, int64_t sn, int64_t sd,
+    int input_dtype_code,
+    cudaStream_t stream)
+{
+    const int blocks = B * H * (D / kDTile);
+
+    DISPATCH_HALF_DTYPE(input_dtype_code, T, [&] {
+        quant_v_fp8_kernel<T><<<blocks, kThreads, 0, stream>>>(
+            static_cast<const T*>(v),
+            static_cast<__nv_fp8_e4m3*>(out),
+            static_cast<float*>(scale),
+            N, padded_N, H, D, sb, sh, sn);
+    });
+}

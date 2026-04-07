@@ -139,6 +139,31 @@ extern "C" {
         void* workspace_ptr,
         int64_t workspace_size,
         cudaStream_t stream);
+
+    // SageAttention kernel launchers
+    void launch_quant_qk_per_thread_int8(
+        const void* q, void* q_int8, void* q_scale,
+        const void* k, void* k_int8, void* k_scale,
+        int B, int H_q, int Lq, int H_kv, int Lk, int C,
+        int BLKQ, int WARPQ, int BLKK, int WARPK,
+        int input_dtype_code, cudaStream_t stream);
+
+    void launch_quant_v_fp8_kernel(
+        const void* v, void* out, void* scale,
+        int B, int H, int N, int D, int padded_N,
+        int64_t sb, int64_t sh, int64_t sn, int64_t sd,
+        int input_dtype_code, cudaStream_t stream);
+
+    void launch_sage_attn_kernel(
+        const void* q, const void* k, const void* v, void* o,
+        const void* q_scale, const void* k_scale, const void* v_scale,
+        int B, int Lq, int Lk, int H_q, int H_kv, int D,
+        int q_st_bz, int q_st_n, int q_st_h,
+        int k_st_bz, int k_st_n, int k_st_h,
+        int v_st_bz, int v_st_h, int v_st_d,
+        int o_st_bz, int o_st_n, int o_st_h,
+        int is_causal, float sm_scale, int output_dtype_code,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -525,6 +550,169 @@ void apply_rope(
     );
 }
 
+// Nanobind wrapper: FP8 V quantization
+void quant_v_fp8(
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> scale,
+    int padded_n,
+    int input_dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (v.ndim() != 4) {
+        throw std::runtime_error("quant_v_fp8: v must be 4D [B,H,N,D]");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quant_v_fp8_kernel(
+        v.data(), out.data(), scale.data(),
+        static_cast<int>(v.shape(0)),
+        static_cast<int>(v.shape(1)),
+        static_cast<int>(v.shape(2)),
+        static_cast<int>(v.shape(3)),
+        padded_n,
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        input_dtype_code, stream);
+}
+
+// Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
+void quant_qk_per_thread_int8(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> k_scale,
+    int BLKQ, int WARPQ, int BLKK, int WARPK,
+    int input_dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4) {
+        throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quant_qk_per_thread_int8(
+        q.data(), q_int8.data(), q_scale.data(),
+        k.data(), k_int8.data(), k_scale.data(),
+        static_cast<int>(q.shape(0)),
+        static_cast<int>(q.shape(1)),
+        static_cast<int>(q.shape(2)),
+        static_cast<int>(k.shape(1)),
+        static_cast<int>(k.shape(2)),
+        static_cast<int>(q.shape(3)),
+        BLKQ, WARPQ, BLKK, WARPK,
+        input_dtype_code, stream);
+}
+
+// Nanobind wrapper: SageAttention INT8 QK / FP8 V attention kernel
+void sage_attn(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> o,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_scale,
+    int is_causal,
+    float sm_scale,
+    int output_dtype_code,
+    uintptr_t stream_ptr)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_sage_attn_kernel(
+        q.data(), k.data(), v.data(), o.data(),
+        q_scale.data(), k_scale.data(), v_scale.data(),
+        static_cast<int>(q.shape(0)),
+        static_cast<int>(q.shape(2)),
+        static_cast<int>(k.shape(2)),
+        static_cast<int>(q.shape(1)),
+        static_cast<int>(k.shape(1)),
+        static_cast<int>(q.shape(3)),
+        q.stride(0), q.stride(2), q.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        v.stride(0), v.stride(1), v.stride(2),
+        o.stride(0), o.stride(2), o.stride(1),
+        is_causal, sm_scale, output_dtype_code,
+        stream);
+}
+
+// Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
+// All scratch buffers are pre-allocated by the caller (Python frontend).
+void sage_sdpa(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> o,
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_quant,
+    nb::ndarray<nb::device::cuda> v_scale,
+    int is_causal,
+    float sm_scale,
+    int input_dtype_code,
+    int output_dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
+        throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
+    }
+
+    const int B = static_cast<int>(q.shape(0));
+    const int H_q = static_cast<int>(q.shape(1));
+    const int Lq = static_cast<int>(q.shape(2));
+    const int D = static_cast<int>(q.shape(3));
+    const int H_kv = static_cast<int>(k.shape(1));
+    const int Lk = static_cast<int>(k.shape(2));
+
+    if (input_dtype_code != 1 && input_dtype_code != 2) {
+        throw std::runtime_error("sage_sdpa: input_dtype_code must be 1 (fp16) or 2 (bf16)");
+    }
+
+    constexpr int BLKQ = 128, WARPQ = 32, BLKK = 64, WARPK = 64;
+    constexpr int CTA_K = 64;
+    const int padded_Lk = ((Lk + CTA_K - 1) / CTA_K) * CTA_K;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+    // Step 1: Quantize Q and K to INT8
+    launch_quant_qk_per_thread_int8(
+        q.data(), q_int8.data(), q_scale.data(),
+        k.data(), k_int8.data(), k_scale.data(),
+        B, H_q, Lq, H_kv, Lk, D,
+        BLKQ, WARPQ, BLKK, WARPK,
+        input_dtype_code, stream);
+
+    // Step 2: Quantize V to FP8
+    launch_quant_v_fp8_kernel(
+        v.data(), v_quant.data(), v_scale.data(),
+        B, H_kv, Lk, D, padded_Lk,
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        input_dtype_code, stream);
+
+    // Step 3: Run attention kernel.
+    // All intermediates are contiguous — compute strides from shapes.
+    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = H_q * Lq * D;
+    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = H_kv * Lk * D;
+    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = H_q * Lq * D;
+    // v_quant is [B*H_kv*D, padded_Lk] (2D from quant kernel).
+    // Attention expects V as [B, H, D, padded_N].
+    const int v_st_d  = padded_Lk;
+    const int v_st_h  = D * padded_Lk;
+    const int v_st_bz = H_kv * D * padded_Lk;
+
+    launch_sage_attn_kernel(
+        q_int8.data(), k_int8.data(), v_quant.data(), o.data(),
+        q_scale.data(), k_scale.data(), v_scale.data(),
+        B, Lq, Lk, H_q, H_kv, D,
+        qi_st_bz, qi_st_n, qi_st_h,
+        ki_st_bz, ki_st_n, ki_st_h,
+        v_st_bz, v_st_h, v_st_d,
+        o_st_bz, o_st_n, o_st_h,
+        is_causal, sm_scale, output_dtype_code,
+        stream);
+}
+
 // Python module definition
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
@@ -599,12 +787,69 @@ NB_MODULE(_C, m) {
           nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
+<<<<<<< HEAD
     m.def("cublas_gemm_int8", &cublas_gemm_int8,
           "INT8 GEMM using cuBLASLt IMMA tensor cores (SM >= 7.5)",
           nb::arg("a"),
           nb::arg("b"),
           nb::arg("c"),
           nb::arg("workspace"),
+=======
+    m.def("_quant_v_fp8", &quant_v_fp8,
+          "Quantize V [B,H,N,D] fp16/bf16 to FP8 E4M3 rows [B*H*D,padded_N] with per-row scale",
+          nb::arg("v"),
+          nb::arg("out"),
+          nb::arg("scale"),
+          nb::arg("padded_n"),
+          nb::arg("input_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("_quant_qk_per_thread_int8", &quant_qk_per_thread_int8,
+          "INT8 per-thread quant for Q and K (HND), same tiling as Triton quant_per_thread",
+          nb::arg("q"),
+          nb::arg("q_int8"),
+          nb::arg("q_scale"),
+          nb::arg("k"),
+          nb::arg("k_int8"),
+          nb::arg("k_scale"),
+          nb::arg("blk_q"),
+          nb::arg("warp_q"),
+          nb::arg("blk_k"),
+          nb::arg("warp_k"),
+          nb::arg("input_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("_sage_attn", &sage_attn,
+          "SageAttention INT8 QK / FP8 V attention kernel",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("o"),
+          nb::arg("q_scale"),
+          nb::arg("k_scale"),
+          nb::arg("v_scale"),
+          nb::arg("is_causal"),
+          nb::arg("sm_scale"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("sage_sdpa", &sage_sdpa,
+          "Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one call",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("o"),
+          nb::arg("q_int8"),
+          nb::arg("q_scale"),
+          nb::arg("k_int8"),
+          nb::arg("k_scale"),
+          nb::arg("v_quant"),
+          nb::arg("v_scale"),
+          nb::arg("is_causal"),
+          nb::arg("sm_scale"),
+          nb::arg("input_dtype_code"),
+          nb::arg("output_dtype_code"),
+>>>>>>> 2bddbf9 (poc sage attention)
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

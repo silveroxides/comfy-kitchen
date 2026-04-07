@@ -45,6 +45,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "scaled_mm_int8",
+    "sage_sdpa",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "set_backend_priority",
@@ -169,8 +170,7 @@ def scaled_mm_nvfp4(
         out_dtype = torch.bfloat16
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
-        a, b, tensor_scale_a, tensor_scale_b,
-        block_scale_a, block_scale_b, bias, dtype_code, alpha
+        a, b, tensor_scale_a, tensor_scale_b, block_scale_a, block_scale_b, bias, dtype_code, alpha
     )
 
 
@@ -260,9 +260,7 @@ def apply_rope(
     return torch.ops.comfy_kitchen.apply_rope(xq, xk, freqs_cis)
 
 
-def apply_rope1(
-    x: torch.Tensor, freqs_cis: torch.Tensor
-) -> torch.Tensor:
+def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply Rotary Position Embedding (RoPE) to a single tensor.
 
     Args:
@@ -275,9 +273,34 @@ def apply_rope1(
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
 
 
+def sage_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+    smooth_k: bool = True,
+) -> torch.Tensor:
+    """SageAttention scaled dot-product attention.
+
+    Args:
+        q: Query tensor [B, H_Q, N_Q, D] (fp16 or bf16)
+        k: Key tensor [B, H_K, N_K, D]
+        v: Value tensor [B, H_K, N_K, D]
+        is_causal: Whether to apply causal masking
+        smooth_k: Whether to subtract per-head K mean before quantisation
+
+    Returns:
+        Output tensor [B, H_Q, N_Q, D] (same dtype as q)
+    """
+    from .sage_attention import sage_sdpa as _sage_sdpa
+
+    return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k)
+
+
 # =============================================================================
 # INT8 API Functions
 # =============================================================================
+
 
 def quantize_int8(
     x: torch.Tensor,
@@ -285,12 +308,12 @@ def quantize_int8(
     is_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise INT8 quantization.
-    
+
     Args:
         x: Input tensor.
         block_size: Quantization block size.
         is_weight: If True, use 2D blocking for weights.
-        
+
     Returns:
         Tuple of (qdata, scale)
     """
@@ -304,13 +327,13 @@ def dequantize_int8(
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Block-wise INT8 dequantization.
-    
+
     Args:
         qx: Quantized INT8 tensor.
         scale: Per-block scaling factors.
         block_size: Block size used for quantization.
         output_dtype: Target output dtype.
-        
+
     Returns:
         Dequantized tensor.
     """
@@ -327,7 +350,7 @@ def scaled_mm_int8(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """INT8 matrix multiplication with block-wise scaling.
-    
+
     Args:
         a: INT8 activations.
         b: INT8 weights.
@@ -335,7 +358,7 @@ def scaled_mm_int8(
         scale_b: Weight scales.
         bias: Optional bias vector.
         out_dtype: Output dtype.
-        
+
     Returns:
         Result tensor.
     """
@@ -371,14 +394,14 @@ def int8_linear(
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
-    
+
     Args:
         x: Input tensor.
         weight: INT8 weight tensor.
         weight_scale: Scalar weight scale.
         bias: Optional bias.
         out_dtype: Output dtype.
-        
+
     Returns:
         Result tensor.
     """
