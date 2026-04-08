@@ -137,11 +137,14 @@ quant_v_fp8_kernel(const T *__restrict__ v, __nv_fp8_e4m3 *__restrict__ out,
           static_cast<__nv_fp8_e4m3>(vals[di]);
   }
 
-  // Zero-fill padding region [N, padded_N) — iterate linearly (coalesced).
-  for (int j = N + threadIdx.x; j < padded_N; j += kThreads) {
+  // Zero-fill padding region [N, padded_N) with the same inverse permutation
+  // so that the layout matches the eager reference for partial 16-element groups.
+  for (int src = N + threadIdx.x; src < padded_N; src += kThreads) {
+    const int w = src & 15;
+    const int dst = (src & ~15) | inv_perm16(w);
 #pragma unroll
     for (int di = 0; di < kDTile; ++di)
-      out[(out_row + di) * padded_N + j] = static_cast<__nv_fp8_e4m3>(0.f);
+      out[(out_row + di) * padded_N + dst] = static_cast<__nv_fp8_e4m3>(0.f);
   }
 }
 

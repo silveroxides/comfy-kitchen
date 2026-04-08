@@ -431,7 +431,10 @@ extern "C" void launch_quant_qk_per_thread_int8(
   const int nl = WARPK >> 3;
   const int q_sc_per_h = q_oblk * 8;
   const int k_sc_per_h = k_oblk * 4;
-  const bool aligned4 = (C & 3) == 0;
+  // ALIGNED4 means every warp lane's 4-channel group is fully in-bounds,
+  // so we can skip per-lane ch<C checks and always use vectorized loads.
+  // 32 lanes × 4 channels = 128, so C must be ≥128 AND 4-aligned.
+  const bool aligned4 = (C >= 128) && ((C & 3) == 0);
 
   float *km_ptr = nullptr;
   if (smooth_k && km_scratch && km_done) {
