@@ -1,0 +1,77 @@
+site_name: comfy-kitchen
+site_description: Fast kernel library for diffusion inference with multiple compute backends.
+repo_url: https://github.com/Comfy-Org/comfy-kitchen
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    # Collapse nav/TOC subsections by default so API pages show classes first;
+    # expand nested entries (methods/attrs) on demand. Avoid navigation.expand
+    # here — it forces every subsection open and makes the TOC feel flat.
+    - navigation.top
+    - toc.follow
+    - toc.integrate
+    - content.code.copy
+
+extra_javascript:
+  - javascripts/toc-collapsible.js
+
+markdown_extensions:
+  - pymdownx.snippets:
+      base_path: ["."]
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - API reference:
+      - Top-level: api.md
+      - Tensor: api-tensor.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            show_source: false
+            show_submodules: false
+            inherited_members: false
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_signature_annotations: true
+            separate_signature: true
+            line_length: 88
+            members_order: alphabetical
+            filters: ["!^_[^_]"]
