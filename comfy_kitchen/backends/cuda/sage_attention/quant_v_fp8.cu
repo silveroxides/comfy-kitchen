@@ -8,9 +8,12 @@
 //
 // One thread block per (b, h, d_tile) with D_TILE=8 d-channels.  512 threads
 // cooperate along N with vectorized 128-bit loads, warp-shuffle absmax
-// reduction, forward permutation for coalesced stores, and reverse Pass 2
-// iteration for L2 cache reuse.  Pass 1 uses 4× manual unroll for
-// memory-level parallelism at low occupancy.
+// reduction, and reverse Pass 2 iteration for L2 cache reuse.  Pass 1 uses
+// 4× manual unroll for memory-level parallelism at low occupancy.
+//
+// Pass 2 iterates over linear source indices (coalesced 128-bit reads) and
+// applies the inverse permutation to compute the destination write index,
+// avoiding the scattered-read pattern of iterating over destination indices.
 
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
@@ -23,6 +26,14 @@ namespace {
 constexpr int kDTile = 8;
 constexpr int kThreads = 512;
 constexpr int kWarps = kThreads / 32;
+
+// FP8 MMA 16-element inverse permutation.
+// Forward: fwd(j) maps bit pattern {b3,b2,b1,b0} → {b1,b3,b2,b0}.
+// Inverse: inv(s) maps {b3,b2,b1,b0} → {b2,b0,b3,b1}.
+__device__ __forceinline__ int inv_perm16(int w) {
+  return (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) |
+         (((w >> 2) & 1) << 3);
+}
 
 template <typename T>
 __global__ void
@@ -106,27 +117,31 @@ quant_v_fp8_kernel(const T *__restrict__ v, __nv_fp8_e4m3 *__restrict__ out,
     inv_sc[di] = inv_sc_sh[di];
 
   // ── Pass 2: quantize + permute (reverse for L2 reuse) ──────────────
+  // Iterate over LINEAR source indices (coalesced reads from v) and compute
+  // the permuted destination index for the FP8 MMA layout.
   const int64_t out_row = static_cast<int64_t>((b * H + h) * D + d0);
 
-  for (int j = padded_N - 1 - threadIdx.x; j >= 0; j -= kThreads) {
-    const int w = j & 15;
-    const int src = (j & ~15) | ((w >> 2) * 2 + ((w >> 1) & 1) * 8 + (w & 1));
+  for (int src = N - 1 - threadIdx.x; src >= 0; src -= kThreads) {
+    const int w = src & 15;
+    const int dst = (src & ~15) | inv_perm16(w);
 
+    const T *tmp = comfy::load_f16x8(base + (int64_t)src * sn);
     float vals[kDTile];
-    if (src < N) {
-      const T *tmp = comfy::load_f16x8(base + (int64_t)src * sn);
 #pragma unroll
-      for (int di = 0; di < kDTile; ++di)
-        vals[di] = static_cast<float>(tmp[di]) * inv_sc[di];
-    } else {
-#pragma unroll
-      for (int di = 0; di < kDTile; ++di)
-        vals[di] = 0.f;
-    }
+    for (int di = 0; di < kDTile; ++di)
+      vals[di] = static_cast<float>(tmp[di]) * inv_sc[di];
 
 #pragma unroll
     for (int di = 0; di < kDTile; ++di)
-      out[(out_row + di) * padded_N + j] = static_cast<__nv_fp8_e4m3>(vals[di]);
+      out[(out_row + di) * padded_N + dst] =
+          static_cast<__nv_fp8_e4m3>(vals[di]);
+  }
+
+  // Zero-fill padding region [N, padded_N) — iterate linearly (coalesced).
+  for (int j = N + threadIdx.x; j < padded_N; j += kThreads) {
+#pragma unroll
+    for (int di = 0; di < kDTile; ++di)
+      out[(out_row + di) * padded_N + j] = static_cast<__nv_fp8_e4m3>(0.f);
   }
 }
 

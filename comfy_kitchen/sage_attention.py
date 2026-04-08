@@ -140,9 +140,6 @@ def sage_sdpa(
     if h_q % h_k != 0:
         raise ValueError(f"num_qo_heads ({h_q}) must be divisible by num_kv_heads ({h_k})")
 
-    if smooth_k:
-        k = k - k.mean(dim=2, keepdim=True)
-
     # Tiling parameters — must match sage_attn_launcher.cu and dlpack_bindings.cpp.
     blkq, warpq, blkk, warpk = 128, 32, 64, 64
     padded_n_k = _pad_to_cta_k(n_k)
@@ -172,6 +169,14 @@ def sage_sdpa(
     v_scale = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
     output = torch.empty(b, h_q, n_q, d, dtype=q.dtype, device=q.device)
 
+    km_scratch_ptr = 0
+    km_done_ptr = 0
+    if smooth_k:
+        km_scratch = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+        km_done = torch.empty(b * h_k, device=q.device, dtype=torch.int32)
+        km_scratch_ptr = km_scratch.data_ptr()
+        km_done_ptr = km_done.data_ptr()
+
     input_dtype_code = DTYPE_TO_CODE[q.dtype]
     output_dtype_code = input_dtype_code
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
@@ -192,5 +197,8 @@ def sage_sdpa(
         input_dtype_code,
         output_dtype_code,
         stream_ptr,
+        int(smooth_k),
+        km_scratch_ptr,
+        km_done_ptr,
     )
     return output

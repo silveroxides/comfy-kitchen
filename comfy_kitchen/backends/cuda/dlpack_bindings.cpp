@@ -144,6 +144,7 @@ extern "C" {
     void launch_quant_qk_per_thread_int8(
         const void* q, void* q_int8, void* q_scale,
         const void* k, void* k_int8, void* k_scale,
+        int smooth_k, void* km_scratch, void* km_done,
         int B, int H_q, int Lq, int H_kv, int Lk, int C,
         int BLKQ, int WARPQ, int BLKK, int WARPK,
         int input_dtype_code, cudaStream_t stream);
@@ -575,6 +576,9 @@ void quant_v_fp8(
 }
 
 // Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
+// smooth_k: 1 = fuse K-mean computation + subtraction into the kernel.
+// km_scratch_ptr / km_done_ptr: device pointers for scratch buffers
+// (pre-zeroed by the caller).  Ignored when smooth_k == 0.
 void quant_qk_per_thread_int8(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> q_int8,
@@ -584,7 +588,10 @@ void quant_qk_per_thread_int8(
     nb::ndarray<nb::device::cuda> k_scale,
     int BLKQ, int WARPQ, int BLKK, int WARPK,
     int input_dtype_code,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr,
+    int smooth_k = 0,
+    uintptr_t km_scratch_ptr = 0,
+    uintptr_t km_done_ptr = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4) {
         throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
@@ -593,6 +600,9 @@ void quant_qk_per_thread_int8(
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
+        smooth_k,
+        reinterpret_cast<void *>(km_scratch_ptr),
+        reinterpret_cast<void *>(km_done_ptr),
         static_cast<int>(q.shape(0)),
         static_cast<int>(q.shape(1)),
         static_cast<int>(q.shape(2)),
@@ -651,6 +661,8 @@ void sage_attn(
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
 // All scratch buffers are pre-allocated by the caller (Python frontend).
+// smooth_k: 1 = fuse K-mean reduction + subtraction into the quant kernel.
+// km_scratch_ptr / km_done_ptr: device memory for the fused mean kernel.
 void sage_sdpa(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> k,
@@ -666,7 +678,10 @@ void sage_sdpa(
     float sm_scale,
     int input_dtype_code,
     int output_dtype_code,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr,
+    int smooth_k = 0,
+    uintptr_t km_scratch_ptr = 0,
+    uintptr_t km_done_ptr = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
@@ -689,10 +704,12 @@ void sage_sdpa(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    // Tiling constants — must match sage_attn_launcher.cu and sage_attention.py.
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
+        smooth_k,
+        reinterpret_cast<void *>(km_scratch_ptr),
+        reinterpret_cast<void *>(km_done_ptr),
         B, H_q, Lq, H_kv, Lk, D,
         BLKQ, WARPQ, BLKK, WARPK,
         input_dtype_code, stream);
@@ -838,7 +855,10 @@ NB_MODULE(_C, m) {
           nb::arg("blk_k"),
           nb::arg("warp_k"),
           nb::arg("input_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("smooth_k") = 0,
+          nb::arg("km_scratch_ptr") = 0,
+          nb::arg("km_done_ptr") = 0);
 
     m.def("_sage_attn", &sage_attn,
           "SageAttention INT8 QK / FP8 V attention kernel",
@@ -870,7 +890,10 @@ NB_MODULE(_C, m) {
           nb::arg("sm_scale"),
           nb::arg("input_dtype_code"),
           nb::arg("output_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("smooth_k") = 0,
+          nb::arg("km_scratch_ptr") = 0,
+          nb::arg("km_done_ptr") = 0);
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();

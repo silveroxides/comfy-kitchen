@@ -101,8 +101,8 @@ extern "C" void launch_sage_attn_kernel(
   } else if (head_dim == 128) {
     DISPATCH_CAUSAL(128);
   } else {
-    throw std::runtime_error(
-        "sage_attn: unsupported head_dim " + std::to_string(head_dim));
+    throw std::runtime_error("sage_attn: unsupported head_dim " +
+                             std::to_string(head_dim));
   }
 
 #undef LAUNCH
