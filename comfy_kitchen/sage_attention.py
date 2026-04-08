@@ -26,6 +26,7 @@ def is_available() -> bool:
         return False
     try:
         from comfy_kitchen.backends.cuda import _EXT_AVAILABLE
+
         if not _EXT_AVAILABLE:
             return False
     except ImportError:
@@ -41,12 +42,12 @@ def _quantize_v_fp8_eager(
     Output layout matches the CUDA kernel: [B, H, D, padded_N] with FP8 MMA
     16-element permutation applied along padded_N.
     """
-    B, H, N, D = v.shape
-    padded_N = ((N + CTA_K - 1) // CTA_K) * CTA_K
+    _b, _h, n, _d = v.shape
+    padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
 
     vt = v.permute(0, 1, 3, 2).contiguous().float()  # [B, H, D, N]
-    if padded_N > N:
-        vt = torch.nn.functional.pad(vt, (0, padded_N - N))
+    if padded_n > n:
+        vt = torch.nn.functional.pad(vt, (0, padded_n - n))
 
     amax = vt.abs().amax(dim=-1)  # [B, H, D]
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
@@ -58,7 +59,7 @@ def _quantize_v_fp8_eager(
 
     # FP8 MMA 16-element permutation: for each output position j, read from
     # source position src within the same 16-element group.
-    idx = torch.arange(padded_N, device=vq.device)
+    idx = torch.arange(padded_n, device=vq.device)
     w = idx & 15
     src = (idx & ~15) | ((w >> 2) * 2 + ((w >> 1) & 1) * 8 + (w & 1))
     vq = vq[..., src]
@@ -76,11 +77,11 @@ def _quantize_v_fp8(
     from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
     from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
 
-    B, H, N, D = v.shape
-    padded_N = ((N + CTA_K - 1) // CTA_K) * CTA_K
+    b, h, n, d = v.shape
+    padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
 
-    out = torch.empty(B * H * D, padded_N, dtype=torch.float8_e4m3fn, device=v.device)
-    scale = torch.empty(B * H * D, device=v.device, dtype=torch.float32)
+    out = torch.empty(b * h * d, padded_n, dtype=torch.float8_e4m3fn, device=v.device)
+    scale = torch.empty(b * h * d, device=v.device, dtype=torch.float32)
 
     code = DTYPE_TO_CODE[v.dtype]
     stream_ptr = torch.cuda.current_stream(v.device).cuda_stream
@@ -88,13 +89,13 @@ def _quantize_v_fp8(
         _wrap_for_dlpack(v),
         _wrap_for_dlpack(out),
         _wrap_for_dlpack(scale),
-        padded_N,
+        padded_n,
         code,
         stream_ptr,
     )
     return (
-        out.view(torch.int8).reshape(B, H, D, padded_N),
-        scale.reshape(B, H, D),
+        out.view(torch.int8).reshape(b, h, d, padded_n),
+        scale.reshape(b, h, d),
     )
 
 
@@ -122,33 +123,43 @@ def sage_sdpa(
     from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
     from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
 
-    B, H_Q, N_Q, D = q.shape
-    _, H_K, N_K, _ = k.shape
-    assert D in (64, 128), f"head_dim must be 64 or 128, got {D}"
-    assert H_Q % H_K == 0, f"num_qo_heads ({H_Q}) must be divisible by num_kv_heads ({H_K})"
+    b, h_q, n_q, d = q.shape
+    _, h_k, n_k, _ = k.shape
+    if d not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {d}")
+    if h_q % h_k != 0:
+        raise ValueError(f"num_qo_heads ({h_q}) must be divisible by num_kv_heads ({h_k})")
 
     if smooth_k:
         k = k - k.mean(dim=2, keepdim=True)
 
-    BLKQ, WARPQ, BLKK, WARPK = 128, 32, 64, 64
-    padded_N_K = ((N_K + CTA_K - 1) // CTA_K) * CTA_K
+    blkq, warpq, blkk, warpk = 128, 32, 64, 64
+    padded_n_k = ((n_k + CTA_K - 1) // CTA_K) * CTA_K
 
     q_int8 = torch.empty_like(q, dtype=torch.int8)
     k_int8 = torch.empty_like(k, dtype=torch.int8)
     q_scale = torch.empty(
-        B, H_Q, ((N_Q + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ) * 8,
-        device=q.device, dtype=torch.float32,
+        b,
+        h_q,
+        ((n_q + blkq - 1) // blkq) * (blkq // warpq) * 8,
+        device=q.device,
+        dtype=torch.float32,
     )
     k_scale = torch.empty(
-        B, H_K, ((N_K + BLKK - 1) // BLKK) * (BLKK // WARPK) * 4,
-        device=q.device, dtype=torch.float32,
+        b,
+        h_k,
+        ((n_k + blkk - 1) // blkk) * (blkk // warpk) * 4,
+        device=q.device,
+        dtype=torch.float32,
     )
     v_quant = torch.empty(
-        B * H_K * D, padded_N_K,
-        dtype=torch.float8_e4m3fn, device=q.device,
+        b * h_k * d,
+        padded_n_k,
+        dtype=torch.float8_e4m3fn,
+        device=q.device,
     )
-    v_scale = torch.empty(B * H_K * D, device=q.device, dtype=torch.float32)
-    output = torch.empty(B, H_Q, N_Q, D, dtype=q.dtype, device=q.device)
+    v_scale = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+    output = torch.empty(b, h_q, n_q, d, dtype=q.dtype, device=q.device)
 
     input_dtype_code = DTYPE_TO_CODE[q.dtype]
     output_dtype_code = input_dtype_code
@@ -166,7 +177,7 @@ def sage_sdpa(
         _wrap_for_dlpack(v_quant),
         _wrap_for_dlpack(v_scale),
         int(is_causal),
-        D ** -0.5,
+        d**-0.5,
         input_dtype_code,
         output_dtype_code,
         stream_ptr,
