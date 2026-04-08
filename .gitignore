@@ -20,3 +20,4 @@ venv13
 .idea/
 *.pyd
 *.so
+.*/
