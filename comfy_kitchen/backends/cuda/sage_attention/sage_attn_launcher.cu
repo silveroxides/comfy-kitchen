@@ -9,6 +9,8 @@
 
 #include "qk_int_sv_f8_cuda_sm89.cuh"
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -21,6 +23,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  int stride_h_v, int stride_d_v, int stride_bz_o,
                  int stride_seq_o, int stride_h_o, float sm_scale,
                  int batch_size, cudaStream_t stream) {
+  // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   constexpr int CTA_Q = 128;
   constexpr int CTA_K = 64;
   constexpr int WARP_Q = 32;
@@ -97,6 +100,9 @@ extern "C" void launch_sage_attn_kernel(
     DISPATCH_CAUSAL(64);
   } else if (head_dim == 128) {
     DISPATCH_CAUSAL(128);
+  } else {
+    throw std::runtime_error(
+        "sage_attn: unsupported head_dim " + std::to_string(head_dim));
   }
 
 #undef LAUNCH

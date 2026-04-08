@@ -17,7 +17,15 @@ from __future__ import annotations
 
 import torch
 
+# Tiling constants — must match the CUDA kernels in
+# sage_attention/sage_attn_launcher.cu and dlpack_bindings.cpp.
 CTA_K = 64
+
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _pad_to_cta_k(n: int) -> int:
+    return ((n + CTA_K - 1) // CTA_K) * CTA_K
 
 
 def is_available() -> bool:
@@ -43,7 +51,7 @@ def _quantize_v_fp8_eager(
     16-element permutation applied along padded_N.
     """
     _b, _h, n, _d = v.shape
-    padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
+    padded_n = _pad_to_cta_k(n)
 
     vt = v.permute(0, 1, 3, 2).contiguous().float()  # [B, H, D, N]
     if padded_n > n:
@@ -78,7 +86,7 @@ def _quantize_v_fp8(
     from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
 
     b, h, n, d = v.shape
-    padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
+    padded_n = _pad_to_cta_k(n)
 
     out = torch.empty(b * h * d, padded_n, dtype=torch.float8_e4m3fn, device=v.device)
     scale = torch.empty(b * h * d, device=v.device, dtype=torch.float32)
@@ -125,6 +133,8 @@ def sage_sdpa(
 
     b, h_q, n_q, d = q.shape
     _, h_k, n_k, _ = k.shape
+    if q.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"q.dtype must be float16 or bfloat16, got {q.dtype}")
     if d not in (64, 128):
         raise ValueError(f"head_dim must be 64 or 128, got {d}")
     if h_q % h_k != 0:
@@ -133,8 +143,9 @@ def sage_sdpa(
     if smooth_k:
         k = k - k.mean(dim=2, keepdim=True)
 
+    # Tiling parameters — must match sage_attn_launcher.cu and dlpack_bindings.cpp.
     blkq, warpq, blkk, warpk = 128, 32, 64, 64
-    padded_n_k = ((n_k + CTA_K - 1) // CTA_K) * CTA_K
+    padded_n_k = _pad_to_cta_k(n_k)
 
     q_int8 = torch.empty_like(q, dtype=torch.int8)
     k_int8 = torch.empty_like(k, dtype=torch.int8)

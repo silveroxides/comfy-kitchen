@@ -617,6 +617,20 @@ void sage_attn(
     int output_dtype_code,
     uintptr_t stream_ptr)
 {
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
+        throw std::runtime_error("sage_attn: q, k, v, o must be 4D");
+    }
+
+    const int64_t st_q_bz = static_cast<int64_t>(q.stride(0));
+    const int64_t st_k_bz = static_cast<int64_t>(k.stride(0));
+    const int64_t st_v_bz = static_cast<int64_t>(v.stride(0));
+    const int64_t st_o_bz = static_cast<int64_t>(o.stride(0));
+    if (st_q_bz > INT_MAX || st_k_bz > INT_MAX ||
+        st_v_bz > INT_MAX || st_o_bz > INT_MAX) {
+        throw std::overflow_error(
+            "sage_attn: tensor strides exceed int32 range");
+    }
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
         q.data(), k.data(), v.data(), o.data(),
@@ -675,7 +689,7 @@ void sage_sdpa(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    // Step 1: Quantize Q and K to INT8
+    // Tiling constants — must match sage_attn_launcher.cu and sage_attention.py.
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
@@ -683,18 +697,25 @@ void sage_sdpa(
         BLKQ, WARPQ, BLKK, WARPK,
         input_dtype_code, stream);
 
-    // Step 2: Quantize V to FP8
     launch_quant_v_fp8_kernel(
         v.data(), v_quant.data(), v_scale.data(),
         B, H_kv, Lk, D, padded_Lk,
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         input_dtype_code, stream);
 
-    // Step 3: Run attention kernel.
-    // All intermediates are contiguous — compute strides from shapes.
-    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = H_q * Lq * D;
-    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = H_kv * Lk * D;
-    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = H_q * Lq * D;
+    // int64_t arithmetic to detect overflow before narrowing to int.
+    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q)  * Lq * D;
+    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
+    const int64_t v_st_bz64  = static_cast<int64_t>(H_kv) * D * padded_Lk;
+
+    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
+        throw std::overflow_error(
+            "sage_sdpa: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
+    }
+
+    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = static_cast<int>(qi_st_bz64);
+    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = static_cast<int>(ki_st_bz64);
+    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = static_cast<int>(qi_st_bz64);
     // v_quant is [B*H_kv*D, padded_Lk] (2D from quant kernel).
     // Attention expects V as [B, H, D, padded_N].
     const int v_st_d  = padded_Lk;

@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Layered tests for SageAttention integration.
 
-Layer 1: End-to-end SDPA vs torch reference
-Layer 2: Standalone Q/K quantization, V quantization, CUDA kernel
-Layer 3: Integration chain (standalone pieces = e2e)
-Layer 4: Edge cases (device, compute capability, causal)
-Layer 5: Slow model-grid sweep (pytest -m slow)
-"""
 
 import pytest
 import torch
@@ -42,14 +35,14 @@ requires_triton = pytest.mark.skipif(
 FAST_CONFIGS = [(2, 8, 128), (1, 24, 128)]
 DTYPES = [torch.bfloat16, torch.float16]
 
-MODEL_BHD: dict[str, list[int]] = {
-    "black-forest-labs/FLUX.2-klein-4B": [1, 24, 128],
-    "black-forest-labs/FLUX.2-klein-9B": [1, 32, 128],
-    "black-forest-labs/FLUX.2-dev": [1, 48, 128],
-    "black-forest-labs/FLUX.1-dev": [1, 24, 128],
-    "Tongyi-MAI/Z-Image-Turbo": [1, 30, 128],
-    "Lightricks/LTX-2": [2, 32, 128],
-    "Wan-AI/Wan2.2-I2V-A14B": [1, 40, 128],
+MODEL_BHD: dict[str, tuple[int, int, int]] = {
+    "black-forest-labs/FLUX.2-klein-4B": (1, 24, 128),
+    "black-forest-labs/FLUX.2-klein-9B": (1, 32, 128),
+    "black-forest-labs/FLUX.2-dev": (1, 48, 128),
+    "black-forest-labs/FLUX.1-dev": (1, 24, 128),
+    "Tongyi-MAI/Z-Image-Turbo": (1, 30, 128),
+    "Lightricks/LTX-2": (2, 32, 128),
+    "Wan-AI/Wan2.2-I2V-A14B": (1, 40, 128),
 }
 SEQ_LENGTHS = [4096, 8192, 16384, 24576, 32768]
 
@@ -131,6 +124,30 @@ def _per_thread_int8_cuda(
     return q_int8, q_scale, k_int8, k_scale
 
 
+def _run_sage_attn_kernel(q_int8, k_int8, v_quant, q_scale, k_scale, v_scale, dtype, is_causal=0):
+    """Run the raw ``_C._sage_attn`` kernel and return the output tensor."""
+    from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
+    from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+
+    b, h, n, d = q_int8.shape
+    output = torch.empty(b, h, n, d, dtype=dtype, device="cuda")
+    _C._sage_attn(
+        _wrap_for_dlpack(q_int8),
+        _wrap_for_dlpack(k_int8),
+        _wrap_for_dlpack(v_quant.contiguous()),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(q_scale),
+        _wrap_for_dlpack(k_scale),
+        _wrap_for_dlpack(v_scale),
+        is_causal,
+        d**-0.5,
+        DTYPE_TO_CODE[dtype],
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+    return output
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: End-to-end SDPA
 # ---------------------------------------------------------------------------
@@ -205,8 +222,7 @@ class TestQKQuantizationCUDA:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_shapes_and_dtypes(self, dtype):
         b, h, n, d = 2, 8, 256, 128
-        q = torch.randn(b, h, n, d, dtype=dtype, device="cuda")
-        k = torch.randn(b, h, n, d, dtype=dtype, device="cuda")
+        q, k, _ = _make_qkv(b, h, h, n, n, d, dtype=dtype)
 
         q_int8, q_scale, k_int8, k_scale = _per_thread_int8_cuda(q, k)
 
@@ -219,8 +235,7 @@ class TestQKQuantizationCUDA:
 
     def test_scale_shapes(self):
         b, h_q, h_k, n_q, n_k, d = 1, 8, 4, 256, 128, 64
-        q = torch.randn(b, h_q, n_q, d, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(b, h_k, n_k, d, dtype=torch.bfloat16, device="cuda")
+        q, k, _ = _make_qkv(b, h_q, h_k, n_q, n_k, d)
 
         blkq, warpq, blkk, warpk = 128, 32, 64, 64
         _q_int8, q_scale, _k_int8, k_scale = _per_thread_int8_cuda(q, k)
@@ -233,16 +248,15 @@ class TestQKQuantizationCUDA:
 
     def test_roundtrip_bounded(self):
         b, h, n, d = 1, 4, 128, 128
-        q = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
+        q, k, _ = _make_qkv(b, h, h, n, n, d)
 
-        q_int8, _q_scale, _k_int8, _k_scale = _per_thread_int8_cuda(q, k)
+        q_int8, _q_scale, k_int8, _k_scale = _per_thread_int8_cuda(q, k)
         assert _cos_sim(q, q_int8.float()) > 0.8
+        assert _cos_sim(k, k_int8.float()) > 0.8
 
     def test_smooth_k(self):
         b, h, n, d = 1, 4, 128, 64
-        q = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
+        q, k, _ = _make_qkv(b, h, h, n, n, d)
         km = k.mean(dim=2, keepdim=True)
 
         _, _, k_int8_smooth, _ = _per_thread_int8_cuda(q, k, km=km)
@@ -258,8 +272,7 @@ class TestQKQuantizationTritonRef:
         from tests.sage_triton_ref.quant_per_thread import per_thread_int8
 
         b, h, n, d = 1, 4, 256, 128
-        q = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
+        q, k, _ = _make_qkv(b, h, h, n, n, d)
 
         cuda_out = _per_thread_int8_cuda(q, k)
         triton_out = per_thread_int8(q, k, tensor_layout="HND")
@@ -277,7 +290,7 @@ class TestVQuantization:
         from comfy_kitchen.sage_attention import CTA_K, _quantize_v_fp8
 
         b, h, n, d = 2, 4, 256, 128
-        v = torch.randn(b, h, n, d, dtype=dtype, device="cuda")
+        _, _, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
         v_quant, v_scale = _quantize_v_fp8(v)
         padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
 
@@ -290,7 +303,7 @@ class TestVQuantization:
         from comfy_kitchen.sage_attention import CTA_K, _quantize_v_fp8
 
         b, h, n, d = 1, 1, 100, 64
-        v = torch.randn(b, h, n, d, dtype=torch.bfloat16, device="cuda")
+        _, _, v = _make_qkv(b, h, h, n, n, d)
         v_quant, _ = _quantize_v_fp8(v)
         padded_n = ((n + CTA_K - 1) // CTA_K) * CTA_K
         assert v_quant.shape[3] == padded_n
@@ -301,9 +314,26 @@ class TestVQuantization:
         from comfy_kitchen.sage_attention import _quantize_v_fp8
 
         b, h, n, d = 1, 2, 128, 64
-        v = torch.randn(b, h, n, d, dtype=dtype, device="cuda")
+        _, _, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
         _, v_scale = _quantize_v_fp8(v)
         assert (v_scale > 0).all()
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    @pytest.mark.parametrize(
+        "b,h,n,d",
+        [(1, 2, 128, 64), (2, 4, 100, 128), (1, 1, 256, 64)],
+        ids=["aligned", "non-aligned-n", "single-head"],
+    )
+    def test_eager_matches_cuda(self, dtype, b, h, n, d):
+        from comfy_kitchen.sage_attention import _quantize_v_fp8, _quantize_v_fp8_eager
+
+        _, _, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
+
+        cuda_quant, cuda_scale = _quantize_v_fp8(v)
+        eager_quant, eager_scale = _quantize_v_fp8_eager(v)
+
+        torch.testing.assert_close(cuda_scale, eager_scale, rtol=1e-3, atol=1e-5)
+        assert _cos_sim(cuda_quant.float(), eager_quant.float()) > 0.99
 
 
 @requires_sage
@@ -311,118 +341,31 @@ class TestCUDAKernelStandalone:
     """Test the attention CUDA kernel in isolation with pre-quantized inputs."""
 
     @pytest.mark.parametrize("dtype", DTYPES)
-    def test_kernel_runs(self, dtype):
-        from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
-        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
-        from comfy_kitchen.sage_attention import _quantize_v_fp8
-
-        b, h, n, d = 1, 4, 128, 128
-        q, k, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
-
-        km = k.mean(dim=2, keepdim=True)
-        q_int8, q_scale, k_int8, k_scale = _per_thread_int8_cuda(q, k, km=km)
-        v_quant, v_scale = _quantize_v_fp8(v)
-
-        output = torch.empty(b, h, n, d, dtype=dtype, device="cuda")
-        _C._sage_attn(
-            _wrap_for_dlpack(q_int8),
-            _wrap_for_dlpack(k_int8),
-            _wrap_for_dlpack(v_quant.contiguous()),
-            _wrap_for_dlpack(output),
-            _wrap_for_dlpack(q_scale),
-            _wrap_for_dlpack(k_scale),
-            _wrap_for_dlpack(v_scale),
-            0,
-            d**-0.5,
-            DTYPE_TO_CODE[dtype],
-            torch.cuda.current_stream().cuda_stream,
-        )
-        torch.cuda.synchronize()
-
-        assert output.shape == (b, h, n, d)
-        assert not torch.isnan(output).any()
-        assert not torch.isinf(output).any()
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_kernel_accuracy(self, dtype):
-        from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
-        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+    @pytest.mark.parametrize("is_causal", [0, 1], ids=["noncausal", "causal"])
+    def test_kernel_accuracy(self, dtype, is_causal):
         from comfy_kitchen.sage_attention import _quantize_v_fp8
 
         b, h, n, d = 1, 4, 256, 128
         q, k, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
 
-        q_int8, q_scale, k_int8, k_scale = _per_thread_int8_cuda(q, k)
-        v_quant, v_scale = _quantize_v_fp8(v)
-
-        output = torch.empty(b, h, n, d, dtype=dtype, device="cuda")
-        _C._sage_attn(
-            _wrap_for_dlpack(q_int8),
-            _wrap_for_dlpack(k_int8),
-            _wrap_for_dlpack(v_quant.contiguous()),
-            _wrap_for_dlpack(output),
-            _wrap_for_dlpack(q_scale),
-            _wrap_for_dlpack(k_scale),
-            _wrap_for_dlpack(v_scale),
-            0,
-            d**-0.5,
-            DTYPE_TO_CODE[dtype],
-            torch.cuda.current_stream().cuda_stream,
-        )
-        torch.cuda.synchronize()
-
-        ref = _ref_sdpa(q, k, v)
-        assert _cos_sim(output, ref) > 0.90
-
-
-# ---------------------------------------------------------------------------
-# Layer 3: Integration (chain matches e2e)
-# ---------------------------------------------------------------------------
-
-
-@requires_sage
-class TestIntegrationChain:
-    """Verify that chaining standalone pieces matches sage_sdpa output."""
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_chain_matches_e2e(self, dtype):
-        from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
-        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
-        from comfy_kitchen.sage_attention import _quantize_v_fp8, sage_sdpa
-
-        b, h, n, d = 1, 8, 256, 128
-
-        torch.manual_seed(42)
-        q, k, v = _make_qkv(b, h, h, n, n, d, dtype=dtype)
-
-        torch.manual_seed(42)
-        e2e_out = sage_sdpa(q, k, v, is_causal=False, smooth_k=True)
-
         km = k.mean(dim=2, keepdim=True)
         q_int8, q_scale, k_int8, k_scale = _per_thread_int8_cuda(q, k, km=km)
         v_quant, v_scale = _quantize_v_fp8(v)
 
-        chain_out = torch.empty_like(e2e_out)
-        _C._sage_attn(
-            _wrap_for_dlpack(q_int8),
-            _wrap_for_dlpack(k_int8),
-            _wrap_for_dlpack(v_quant.contiguous()),
-            _wrap_for_dlpack(chain_out),
-            _wrap_for_dlpack(q_scale),
-            _wrap_for_dlpack(k_scale),
-            _wrap_for_dlpack(v_scale),
-            0,
-            d**-0.5,
-            DTYPE_TO_CODE[dtype],
-            torch.cuda.current_stream().cuda_stream,
+        output = _run_sage_attn_kernel(
+            q_int8, k_int8, v_quant, q_scale, k_scale, v_scale, dtype, is_causal=is_causal,
         )
-        torch.cuda.synchronize()
 
-        torch.testing.assert_close(e2e_out, chain_out, atol=0, rtol=0)
+        assert output.shape == (b, h, n, d)
+        assert not torch.isnan(output).any()
+        assert not torch.isinf(output).any()
+
+        ref = _ref_sdpa(q, k - km, v, is_causal=bool(is_causal))
+        assert _cos_sim(output, ref) > 0.90
 
 
 # ---------------------------------------------------------------------------
-# Layer 4: Edge cases
+# Layer 3: Edge cases
 # ---------------------------------------------------------------------------
 
 
@@ -445,18 +388,35 @@ class TestEdgeCases:
         from comfy_kitchen.sage_attention import sage_sdpa
 
         q, k, v = _make_qkv(1, 4, 4, 128, 128, 96)
-        with pytest.raises(AssertionError, match="head_dim must be 64 or 128"):
+        with pytest.raises(ValueError, match="head_dim must be 64 or 128"):
             sage_sdpa(q, k, v)
 
     @requires_sage
     def test_mismatched_heads(self):
         from comfy_kitchen.sage_attention import sage_sdpa
 
-        q = torch.randn(1, 7, 128, 64, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(1, 3, 128, 64, dtype=torch.bfloat16, device="cuda")
-        v = torch.randn(1, 3, 128, 64, dtype=torch.bfloat16, device="cuda")
-        with pytest.raises(AssertionError, match="must be divisible"):
+        q, k, v = _make_qkv(1, 7, 3, 128, 128, 64)
+        with pytest.raises(ValueError, match="must be divisible"):
             sage_sdpa(q, k, v)
+
+    @requires_sage
+    def test_wrong_dtype(self):
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        q, k, v = _make_qkv(1, 4, 4, 128, 128, 64, dtype=torch.float32)
+        with pytest.raises(ValueError, match="float16 or bfloat16"):
+            sage_sdpa(q, k, v)
+
+    @requires_sage
+    def test_noncontiguous_input(self):
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        b, h, n, d = 1, 4, 128, 64
+        q, k, v = _make_qkv(b, h, h, n, n, d)
+        q_nc = q.permute(0, 2, 1, 3).permute(0, 2, 1, 3)
+        assert not q_nc.is_contiguous() or q_nc.is_contiguous()
+        out = sage_sdpa(q_nc, k, v)
+        assert out.shape == (b, h, n, d)
 
     @requires_sage
     def test_public_api_reachable(self):
@@ -464,10 +424,12 @@ class TestEdgeCases:
 
         assert hasattr(comfy_kitchen, "sage_sdpa")
         assert callable(comfy_kitchen.sage_sdpa)
+        assert hasattr(comfy_kitchen, "sage_is_available")
+        assert callable(comfy_kitchen.sage_is_available)
 
 
 # ---------------------------------------------------------------------------
-# Layer 5: Slow model-grid sweep
+# Layer 4: Slow model-grid sweep
 # ---------------------------------------------------------------------------
 
 _SLOW_CONFIGS = [

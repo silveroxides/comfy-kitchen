@@ -69,16 +69,12 @@ quant_v_fp8_kernel(const T *__restrict__ v, __nv_fp8_e4m3 *__restrict__ out,
       mx[di] = fmaxf(mx[di], fabsf(static_cast<float>(tmp[di])));
   }
 
-  // Warp-level max reduction via shuffle
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
 
 #pragma unroll
-  for (int di = 0; di < kDTile; ++di) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      mx[di] = fmaxf(mx[di], __shfl_xor_sync(0xffffffff, mx[di], off));
-  }
+  for (int di = 0; di < kDTile; ++di)
+    mx[di] = comfy::warp_reduce_fmax(mx[di]);
 
   // Cross-warp reduction
   __shared__ float warp_mx[kDTile][kWarps];

@@ -45,6 +45,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "scaled_mm_int8",
+    "sage_is_available",
     "sage_sdpa",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
@@ -271,6 +272,13 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
+
+
+def sage_is_available() -> bool:
+    """Return True if SageAttention CUDA kernels can run on the current device."""
+    from .sage_attention import is_available
+
+    return is_available()
 
 
 def sage_sdpa(

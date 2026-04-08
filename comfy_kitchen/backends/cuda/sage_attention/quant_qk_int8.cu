@@ -11,33 +11,17 @@
 //   stores. No __syncthreads anywhere – pure warp-level reductions.
 
 #include "dtype_dispatch.cuh"
+#include "float_utils.cuh"
 
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+using comfy::quant_int8;
+using comfy::store4_i8;
+using comfy::warp_reduce_fmax;
+
 namespace {
-
-__device__ __forceinline__ int8_t quant_int8(float v, float scale) {
-  float t = v / scale;
-  t += (t >= 0.f ? 0.5f : -0.5f);
-  return static_cast<int8_t>(t);
-}
-
-__device__ __forceinline__ float warp_reduce_fmax(float v) {
-  constexpr unsigned M = 0xffffffff;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    v = fmaxf(v, __shfl_xor_sync(M, v, o));
-  return v;
-}
-
-__device__ __forceinline__ void store4_i8(int8_t *ptr, int8_t a, int8_t b,
-                                          int8_t c, int8_t d) {
-  *reinterpret_cast<int32_t *>(ptr) =
-      (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
-      ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
-}
 
 // ---------------------------------------------------------------------------
 // Q processing: warp-per-group, 4 warps, each warp handles 2 off_tld.

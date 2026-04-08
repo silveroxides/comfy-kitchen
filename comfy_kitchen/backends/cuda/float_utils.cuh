@@ -24,6 +24,29 @@
 
 namespace comfy {
 
+// Warp-wide max-absolute-value reduction via XOR shuffle.
+__device__ __forceinline__ float warp_reduce_fmax(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
+  return v;
+}
+
+// Quantize a single float to int8 with round-half-away-from-zero.
+__device__ __forceinline__ int8_t quant_int8(float v, float scale) {
+  float t = v / scale;
+  t += (t >= 0.f ? 0.5f : -0.5f);
+  return static_cast<int8_t>(t);
+}
+
+// Pack 4 int8 values into one int32 store (little-endian).
+__device__ __forceinline__ void store4_i8(int8_t *ptr, int8_t a, int8_t b,
+                                          int8_t c, int8_t d) {
+  *reinterpret_cast<int32_t *>(ptr) =
+      (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
+      ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
+}
+
 // FP8 type traits for max values
 template <typename T>
 struct FP8LimitsTrait;
