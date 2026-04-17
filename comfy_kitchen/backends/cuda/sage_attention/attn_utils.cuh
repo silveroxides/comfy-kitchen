@@ -200,6 +200,7 @@ load_fp8_V_global_to_share(int8_t **lane_ptr, uint32_t &smem_offset,
       gmem_stride;
 }
 
+#pragma nv_diag_suppress 174
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
           SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK>
@@ -285,6 +286,7 @@ compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q,
   offset_Q -= (2 * num_tiles_qk_inner);
   offset_K -= (2 * num_tiles_qk_inner);
 }
+#pragma nv_diag_default 174
 
 // for case when num_tiles_qk_inner = 1
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
@@ -631,6 +633,7 @@ compute_fp16_sv(const smem_t<swizzle_mode, stride> &smem_V,
   }
 }
 
+#pragma nv_diag_suppress 174
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
           uint32_t stride, uint32_t RS_width = 4, typename T,
@@ -746,6 +749,7 @@ compute_fp16_sv_permuted_inst_buf(const smem_t<swizzle_mode, stride> &smem_V,
   // make offset_V their original value
   offset_V -= (16 * num_tiles_k * stride);
 }
+#pragma nv_diag_default 174
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_v,
           ComputeUnit compute_unit =

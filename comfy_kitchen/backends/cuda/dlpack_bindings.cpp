@@ -808,14 +808,14 @@ NB_MODULE(_C, m) {
           nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
-<<<<<<< HEAD
     m.def("cublas_gemm_int8", &cublas_gemm_int8,
           "INT8 GEMM using cuBLASLt IMMA tensor cores (SM >= 7.5)",
           nb::arg("a"),
           nb::arg("b"),
           nb::arg("c"),
           nb::arg("workspace"),
-=======
+          nb::arg("stream_ptr"));
+
     m.def("_quant_v_fp8", &quant_v_fp8,
           "Quantize V [B,H,N,D] fp16/bf16 to FP8 E4M3 rows [B*H*D,padded_N] with per-row scale",
           nb::arg("v"),
@@ -870,7 +870,6 @@ NB_MODULE(_C, m) {
           nb::arg("sm_scale"),
           nb::arg("input_dtype_code"),
           nb::arg("output_dtype_code"),
->>>>>>> 2bddbf9 (poc sage attention)
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
