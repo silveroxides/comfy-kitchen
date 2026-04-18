@@ -410,7 +410,9 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
-    return torch.ops.comfy_kitchen.mm_int8(a, b)
+    from .backends.eager.quantization import mm_int8 as _mm_int8
+
+    return _mm_int8(a, b)
 
 
 def int8_linear(

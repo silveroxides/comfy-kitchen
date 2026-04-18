@@ -38,6 +38,7 @@ DTYPE_CODE_TO_DTYPE = {
 
 DTYPE_TO_CODE = {v: k for k, v in DTYPE_CODE_TO_DTYPE.items()}
 
+
 def quantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.float8_e4m3fn
 ) -> torch.Tensor:
@@ -54,11 +55,13 @@ def quantize_per_tensor_fp8(
     temp = torch.clamp(temp, -lp_max, lp_max, out=temp)
     return temp.to(output_type)
 
+
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
     dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type)
     return dq_tensor
+
 
 def quantize_nvfp4(
     x: torch.Tensor,
@@ -91,11 +94,13 @@ def quantize_nvfp4(
     total_scale = per_tensor_scale * scaled_block_scales_fp32
 
     # Handle zero blocks (from padding): avoid 0/0 NaN
-    zero_scale_mask = (total_scale == 0)
+    zero_scale_mask = total_scale == 0
     total_scale_safe = torch.where(zero_scale_mask, torch.ones_like(total_scale), total_scale)
 
     data_scaled = x.float() / total_scale_safe.unsqueeze(-1)
-    data_scaled = torch.where(zero_scale_mask.unsqueeze(-1), torch.zeros_like(data_scaled), data_scaled)
+    data_scaled = torch.where(
+        zero_scale_mask.unsqueeze(-1), torch.zeros_like(data_scaled), data_scaled
+    )
 
     out_scales = scaled_block_scales_fp8
 
@@ -108,10 +113,9 @@ def quantize_nvfp4(
     return data_lp, blocked_scales
 
 
-E2M1_LUT = torch.tensor([
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
-]).unsqueeze(1)
+E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+).unsqueeze(1)
 
 E2M1_LUT_CACHE = {}
 
@@ -150,9 +154,7 @@ def dequantize_nvfp4(
 
     # Use from_blocked to unswizzle the tiled layout
     block_scales_unswizzled = from_blocked(
-        block_scales,
-        num_rows=orig_shape[0],
-        num_cols=num_blocks_per_row
+        block_scales, num_rows=orig_shape[0], num_cols=num_blocks_per_row
     )
 
     # Compute total decode scale: per_tensor_scale * block_scale_fp8
@@ -185,10 +187,10 @@ def scaled_mm_nvfp4(
         scale_b=[block_scale_b.view(-1), tensor_scale_b],
         bias=bias,
         out_dtype=out_dtype,
-        scale_recipe_a = [ScalingType.BlockWise1x16, ScalingType.TensorWise],
-        scale_recipe_b = [ScalingType.BlockWise1x16, ScalingType.TensorWise],
-        swizzle_a = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
-        swizzle_b = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
+        scale_recipe_a=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        scale_recipe_b=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        swizzle_a=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
+        swizzle_b=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
     )
 
     return result
@@ -232,7 +234,9 @@ def quantize_mxfp8(
             x = torch.nn.functional.pad(x, (0, padded_cols - cols, 0, padded_rows - rows))
             orig_shape = x.shape
     else:
-        assert x.shape[1] % MXFP8_BLOCK_SIZE == 0, f"K dimension must be divisible by {MXFP8_BLOCK_SIZE}"
+        assert x.shape[1] % MXFP8_BLOCK_SIZE == 0, (
+            f"K dimension must be divisible by {MXFP8_BLOCK_SIZE}"
+        )
 
     rows, cols = orig_shape
     num_blocks = cols // MXFP8_BLOCK_SIZE
@@ -240,7 +244,7 @@ def quantize_mxfp8(
     max_abs = torch.amax(torch.abs(x_blocked), dim=-1)
 
     scale_needed = max_abs.float() / F8_E4M3_MAX
-    scale_needed = torch.clamp(scale_needed, min=2**(-127))  # Min E8M0 value
+    scale_needed = torch.clamp(scale_needed, min=2 ** (-127))  # Min E8M0 value
 
     # Convert to E8M0 exponent (round up to ensure values fit)
     log2_scale = torch.log2(scale_needed)
@@ -251,7 +255,7 @@ def quantize_mxfp8(
     block_scales_f32 = e8m0_to_f32(block_scales_e8m0)
 
     # Handle zero blocks
-    zero_mask = (max_abs == 0)
+    zero_mask = max_abs == 0
     block_scales_f32 = torch.where(zero_mask, torch.ones_like(block_scales_f32), block_scales_f32)
 
     # Quantize: scale down by block scale, then clamp and convert to FP8
@@ -263,7 +267,9 @@ def quantize_mxfp8(
     data_fp8 = data_scaled.reshape(orig_shape).to(torch.float8_e4m3fn)
 
     # Handle zero blocks in scales
-    block_scales_e8m0 = torch.where(zero_mask, torch.zeros_like(block_scales_e8m0), block_scales_e8m0)
+    block_scales_e8m0 = torch.where(
+        zero_mask, torch.zeros_like(block_scales_e8m0), block_scales_e8m0
+    )
 
     # Convert scales to swizzled layout for cuBLAS compatibility
     # For MXFP8 with block size 32, we have num_blocks = K/32
@@ -293,11 +299,7 @@ def dequantize_mxfp8(
 
     # Unswizzle block_scales from cuBLAS tiled layout
     block_scales_uint8 = block_scales.view(torch.uint8)
-    block_scales_unswizzled = from_blocked(
-        block_scales_uint8,
-        num_rows=rows,
-        num_cols=num_blocks
-    )
+    block_scales_unswizzled = from_blocked(block_scales_uint8, num_rows=rows, num_cols=num_blocks)
 
     # Convert E8M0 scales to float32
     block_scales_f32 = e8m0_to_f32(block_scales_unswizzled)
@@ -318,7 +320,7 @@ def scaled_mm_mxfp8(
     block_scale_a: torch.Tensor,
     block_scale_b: torch.Tensor,
     bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """MXFP8 matrix multiplication using block-wise E8M0 scales.
 
@@ -348,6 +350,7 @@ def scaled_mm_mxfp8(
     )
 
     return result
+
 
 # =============================================================================
 # INT8 Block-wise Quantization
@@ -453,7 +456,7 @@ def dequantize_int8(
     Returns:
         Dequantized tensor with original shape.
     """
-    is_weight = (scale.dim() == 2 and qx.dim() == 2)
+    is_weight = scale.dim() == 2 and qx.dim() == 2
 
     if is_weight:
         # 2D block-wise dequantization for weights
@@ -597,7 +600,13 @@ def _op_quantize_nvfp4(
     """
     from comfy_kitchen.registry import registry
 
-    kwargs = {"x": x, "per_tensor_scale": per_tensor_scale, "epsilon": epsilon, "pad_16x": pad_16x, "hi_first": hi_first}
+    kwargs = {
+        "x": x,
+        "per_tensor_scale": per_tensor_scale,
+        "epsilon": epsilon,
+        "pad_16x": pad_16x,
+        "hi_first": hi_first,
+    }
     impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
 
@@ -645,7 +654,13 @@ def _op_dequantize_nvfp4(
     from comfy_kitchen.registry import registry
 
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"qx": qx, "per_tensor_scale": per_tensor_scale, "block_scales": block_scales, "output_type": output_dtype, "hi_first": hi_first}
+    kwargs = {
+        "qx": qx,
+        "per_tensor_scale": per_tensor_scale,
+        "block_scales": block_scales,
+        "output_type": output_dtype,
+        "hi_first": hi_first,
+    }
     impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
 
@@ -692,10 +707,15 @@ def _op_scaled_mm_nvfp4(
 
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
-        "a": a, "b": b,
-        "tensor_scale_a": tensor_scale_a, "tensor_scale_b": tensor_scale_b,
-        "block_scale_a": block_scale_a, "block_scale_b": block_scale_b,
-        "bias": bias, "out_dtype": out_dtype, "alpha": alpha,
+        "a": a,
+        "b": b,
+        "tensor_scale_a": tensor_scale_a,
+        "tensor_scale_b": tensor_scale_b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "alpha": alpha,
     }
     impl = registry.get_implementation("scaled_mm_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
@@ -703,8 +723,15 @@ def _op_scaled_mm_nvfp4(
 
 @_op_scaled_mm_nvfp4.register_fake
 def _op_scaled_mm_nvfp4_fake(
-    a, b, tensor_scale_a, tensor_scale_b,
-    block_scale_a, block_scale_b, bias, output_dtype_code, alpha
+    a,
+    b,
+    tensor_scale_a,
+    tensor_scale_b,
+    block_scale_a,
+    block_scale_b,
+    bias,
+    output_dtype_code,
+    alpha,
 ):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     m = a.shape[0]
@@ -715,6 +742,7 @@ def _op_scaled_mm_nvfp4_fake(
 # =============================================================================
 # MXFP8 Custom Ops
 # =============================================================================
+
 
 @torch.library.custom_op("comfy_kitchen::quantize_mxfp8", mutates_args=())
 def _op_quantize_mxfp8(
@@ -755,7 +783,9 @@ def _op_quantize_mxfp8_fake(x, pad_32x):
     num_blocks = cols // 32
     scale_rows = roundup(rows, 128)
     scale_cols = roundup(num_blocks, 4)
-    block_scales = torch.empty((scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=x.device)
+    block_scales = torch.empty(
+        (scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=x.device
+    )
 
     return qdata, block_scales
 
@@ -818,23 +848,29 @@ def _op_scaled_mm_mxfp8(
 
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
-        "a": a, "b": b,
-        "block_scale_a": block_scale_a, "block_scale_b": block_scale_b,
-        "bias": bias, "out_dtype": out_dtype,
+        "a": a,
+        "b": b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "bias": bias,
+        "out_dtype": out_dtype,
     }
     impl = registry.get_implementation("scaled_mm_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_scaled_mm_mxfp8.register_fake
-def _op_scaled_mm_mxfp8_fake(
-    a, b, block_scale_a, block_scale_b, bias, output_dtype_code
-):
+def _op_scaled_mm_mxfp8_fake(a, b, block_scale_a, block_scale_b, bias, output_dtype_code):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     m = a.shape[0]
     n = b.shape[0]
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
 
+
+# TODO: add torch.library.custom_op wrappers for block-wise INT8 ops:
+# comfy_kitchen::quantize_int8, comfy_kitchen::dequantize_int8,
+# comfy_kitchen::scaled_mm_int8 — currently called via torch.ops but ops
+# not registered, so comfy_kitchen.quantize_int8() etc. raise AttributeError.
 
 # =============================================================================
 # INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
@@ -861,7 +897,6 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if hasattr(torch, "int8_mm"):
         return torch.int8_mm(a, b)
     return torch._int_mm(a, b)
-
 
 
 def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -959,7 +994,7 @@ def int8_linear(
         chunk = result[i:end_i].float()
 
         # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
-        chunk_scales = (weight_scale * x_scale[i:end_i])
+        chunk_scales = weight_scale * x_scale[i:end_i]
         chunk_scaled = chunk * chunk_scales
 
         # Convert to output dtype immediately to free memory
@@ -973,3 +1008,85 @@ def int8_linear(
 
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
+
+# =============================================================================
+# torch.library Custom Op Definitions — INT8 Tensor-wise
+# =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_tensorwise", mutates_args=())
+def _op_quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_tensorwise.register_fake
+def _op_quantize_int8_tensorwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_rowwise", mutates_args=())
+def _op_quantize_int8_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_rowwise.register_fake
+def _op_quantize_int8_rowwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty(*x.shape[:-1], 1, dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
+def _op_dequantize_int8_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"q": q, "scale": scale}
+    impl = registry.get_implementation("dequantize_int8_simple", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_simple.register_fake
+def _op_dequantize_int8_simple_fake(q, scale):
+    return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear", mutates_args=())
+def _op_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {"x": x, "weight": weight, "weight_scale": weight_scale, "out_dtype": out_dtype}
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    result = impl(**kwargs)
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype)
+    return result
+
+
+@_op_int8_linear.register_fake
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)

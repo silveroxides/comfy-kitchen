@@ -6,6 +6,7 @@ __all__ = [
     "dequantize_per_tensor_fp8",
     "int8_linear",
     "quantize_int8",
+    "quantize_int8_rowwise",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -29,6 +30,7 @@ try:
         quantize_nvfp4,
         quantize_per_tensor_fp8,
         scaled_mm_int8,
+        triton_quantize_rowwise as quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1
 except ImportError as e:
@@ -160,6 +162,13 @@ def _build_constraints() -> dict:
                     shape_rules=(ExactDims(2),),
                 ),
                 "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
