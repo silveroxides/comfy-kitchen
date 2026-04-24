@@ -52,7 +52,7 @@ class TestAwqUnpack:
 
     def test_unpack_known_bytes(self):
         # 0xF0 -> lo=0, hi=15; 0x5A -> lo=10, hi=5
-        packed = torch.tensor([[0xF0, 0x5A]], dtype=torch.int8)
+        packed = torch.tensor([[0xF0, 0x5A]], dtype=torch.uint8).view(torch.int8)
         expected = torch.tensor([[0, 15, 10, 5]], dtype=torch.int8)
         assert torch.equal(_unpack_uint4_row_major(packed), expected)
 
