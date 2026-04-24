@@ -17,12 +17,37 @@
 #ifndef COMFY_FLOAT_UTILS_CUH_
 #define COMFY_FLOAT_UTILS_CUH_
 
+#include <cstdint>
+
 #include <cuda_fp8.h>
 #if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 
 namespace comfy {
+
+// Warp-wide max-absolute-value reduction via XOR shuffle.
+__device__ __forceinline__ float warp_reduce_fmax(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
+  return v;
+}
+
+// Quantize a single float to int8 with round-half-away-from-zero.
+__device__ __forceinline__ int8_t quant_int8(float v, float scale) {
+  float t = v / scale;
+  t += (t >= 0.f ? 0.5f : -0.5f);
+  return static_cast<int8_t>(t);
+}
+
+// Pack 4 int8 values into one int32 store (little-endian).
+__device__ __forceinline__ void store4_i8(int8_t *ptr, int8_t a, int8_t b,
+                                          int8_t c, int8_t d) {
+  *reinterpret_cast<int32_t *>(ptr) =
+      (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
+      ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
+}
 
 // FP8 type traits for max values
 template <typename T>
@@ -37,17 +62,6 @@ struct FP8LimitsTrait<__nv_fp8_e4m3> {
 template <>
 struct FP8LimitsTrait<__nv_fp8_e5m2> {
   static constexpr float max = 57344.0f;
-  static constexpr float max_inverse = 1.0 / max;
-};
-
-#if CUDA_VERSION >= 12080
-// FP4 type traits
-template <typename T>
-struct FP4LimitsTrait;
-
-template <>
-struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
-  static constexpr float max = 6.0f;
   static constexpr float max_inverse = 1.0 / max;
 };
 
@@ -80,23 +94,39 @@ template<typename IType>
 }
 #pragma nv_diag_default 1056
 
+#if CUDA_VERSION >= 12080
+// FP4 type traits
+template <typename T>
+struct FP4LimitsTrait;
+
+template <>
+struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
+  static constexpr float max = 6.0f;
+  static constexpr float max_inverse = 1.0 / max;
+};
+
 // Store 2 FP4 values (1 __nv_fp4x2)
-template<typename OType>
+// hi_first=true: val0 in high nibble, val1 in low nibble (default, matches cuBLAS convention)
+// hi_first=false: val0 in low nibble, val1 in high nibble
+template<typename OType, bool hi_first = true>
 __forceinline__ __device__ void store_fp4x2(OType* output, size_t idx, float val0, float val1) {
+    float2 args = hi_first ? float2{val1, val0} : float2{val0, val1};
     *reinterpret_cast<__nv_fp4x2_storage_t*>(&output[idx]) =
-        __nv_cvt_float2_to_fp4x2(float2{val1, val0}, __NV_E2M1, cudaRoundNearest);
+        __nv_cvt_float2_to_fp4x2(args, __NV_E2M1, cudaRoundNearest);
 }
 
 // Store 4 FP4 values (2 __nv_fp4x2) using single store
-template<typename OType>
+template<typename OType, bool hi_first = true>
 __forceinline__ __device__ void store_fp4x4(OType* output, size_t idx, float val0, float val1, float val2, float val3) {
     union {
         uint16_t u16;
         __nv_fp4x2_storage_t fp4x2[2];
     } packed;
 
-    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(float2{val1, val0}, __NV_E2M1, cudaRoundNearest);
-    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(float2{val3, val2}, __NV_E2M1, cudaRoundNearest);
+    float2 args0 = hi_first ? float2{val1, val0} : float2{val0, val1};
+    float2 args1 = hi_first ? float2{val3, val2} : float2{val2, val3};
+    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(args0, __NV_E2M1, cudaRoundNearest);
+    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(args1, __NV_E2M1, cudaRoundNearest);
 
     *reinterpret_cast<uint16_t*>(&output[2*idx]) = packed.u16;
 }

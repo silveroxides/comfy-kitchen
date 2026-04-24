@@ -28,11 +28,14 @@ class TestQuantizeINT8:
             pytest.skip(f"No backend supports quantize_int8 on {device}")
         return backends
 
-    @pytest.mark.parametrize("shape,is_weight", [
-        ((256, 512), True),   # Weight tensor
-        ((128, 256), False),  # Activation tensor
-        ((64, 128, 256), False),  # 3D activation
-    ])
+    @pytest.mark.parametrize(
+        "shape,is_weight",
+        [
+            ((256, 512), True),  # Weight tensor
+            ((128, 256), False),  # Activation tensor
+            ((64, 128, 256), False),  # 3D activation
+        ],
+    )
     def test_quantize_int8_shapes(self, capable_backends, device, seed, shape, is_weight):
         """Test INT8 quantization with various shapes."""
         for backend_name in capable_backends:
@@ -73,7 +76,9 @@ class TestQuantizeINT8:
 
             # INT8 quantization should have small error (<5% relative)
             rel_error = (x - dx).abs() / (x.abs() + 1e-8)
-            assert rel_error.mean() < 0.05, f"{backend_name}: mean relative error too high: {rel_error.mean()}"
+            assert rel_error.mean() < 0.05, (
+                f"{backend_name}: mean relative error too high: {rel_error.mean()}"
+            )
 
 
 class TestScaledMMINT8:
@@ -86,10 +91,13 @@ class TestScaledMMINT8:
             pytest.skip(f"No backend supports scaled_mm_int8 on {device}")
         return backends
 
-    @pytest.mark.parametrize("m,k,n", [
-        (256, 512, 256),
-        (128, 256, 128),
-    ])
+    @pytest.mark.parametrize(
+        "m,k,n",
+        [
+            (256, 512, 256),
+            (128, 256, 128),
+        ],
+    )
     def test_scaled_mm_int8_correctness(self, capable_backends, device, seed, m, k, n):
         """Test INT8 scaled_mm produces correct results."""
         for backend_name in capable_backends:
@@ -197,15 +205,15 @@ class TestINT8CrossBackend:
         triton_qx, triton_s = triton_quant(x, block_size=128, is_weight=True)
 
         assert_values_close(
-            eager_qx.float(), triton_qx.float(),
-            rtol=0.0, atol=1.0,  # Allow 1 unit difference
-            name="quantized data (triton vs eager)"
+            eager_qx.float(),
+            triton_qx.float(),
+            rtol=0.0,
+            atol=1.0,  # Allow 1 unit difference
+            name="quantized data (triton vs eager)",
         )
 
         assert_values_close(
-            eager_s, triton_s,
-            rtol=1e-4, atol=1e-6,
-            name="scales (triton vs eager)"
+            eager_s, triton_s, rtol=1e-4, atol=1e-6, name="scales (triton vs eager)"
         )
 
 
@@ -222,10 +230,13 @@ class TestFusedINT8GEMMQuant:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-    @pytest.mark.parametrize("m,k,n", [
-        (256, 512, 256),
-        (128, 256, 128),
-    ])
+    @pytest.mark.parametrize(
+        "m,k,n",
+        [
+            (256, 512, 256),
+            (128, 256, 128),
+        ],
+    )
     def test_scaled_mm_int8_quant_correctness(self, cuda_available, seed, m, k, n):
         """Test fused GEMM+quant produces correct results."""
         from comfy_kitchen.backends.triton.quantization import (
@@ -251,12 +262,18 @@ class TestFusedINT8GEMMQuant:
         fused_quant, fused_scale = scaled_mm_int8_quant(qa, qb, a_s, b_s, out_block_size=128)
 
         # Dequantize both and compare
-        ref_dequant = dequantize_int8(ref_quant, ref_scale, block_size=128, output_dtype=torch.float32)
-        fused_dequant = dequantize_int8(fused_quant, fused_scale, block_size=128, output_dtype=torch.float32)
+        ref_dequant = dequantize_int8(
+            ref_quant, ref_scale, block_size=128, output_dtype=torch.float32
+        )
+        fused_dequant = dequantize_int8(
+            fused_quant, fused_scale, block_size=128, output_dtype=torch.float32
+        )
 
         # Should be close (may have small differences due to fused vs separate quantization)
         rel_error = (ref_dequant - fused_dequant).abs() / (ref_dequant.abs() + 1e-8)
-        assert rel_error.mean() < 0.1, f"Fused vs separate quantization error too high: {rel_error.mean()}"
+        assert rel_error.mean() < 0.1, (
+            f"Fused vs separate quantization error too high: {rel_error.mean()}"
+        )
 
     def test_scaled_mm_int8_quant_with_bias(self, cuda_available, seed):
         """Test fused GEMM+quant with bias."""
@@ -275,11 +292,180 @@ class TestFusedINT8GEMMQuant:
         qb, b_s = quantize_int8(b, block_size=128, is_weight=True)
 
         # Fused with bias
-        fused_quant, fused_scale = scaled_mm_int8_quant(qa, qb, a_s, b_s, bias=bias, out_block_size=128)
+        fused_quant, fused_scale = scaled_mm_int8_quant(
+            qa, qb, a_s, b_s, bias=bias, out_block_size=128
+        )
 
         assert fused_quant.shape == (m, n)
         assert fused_quant.dtype == torch.int8
         assert fused_scale.shape == (m, n // 128)
+
+
+# =============================================================================
+# TensorWiseINT8Layout Tests
+# =============================================================================
+
+
+class TestTensorWiseINT8Layout:
+    """Tests for TensorWiseINT8Layout quantized tensor format."""
+
+    @pytest.fixture(autouse=True)
+    def cuda_only(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for TensorWiseINT8Layout tests")
+
+    def test_weight_quantize_shape_dtype(self, seed):
+        """Weight path: output INT8, scalar scale, shape preserved."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+
+        w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        assert qt._qdata.dtype == torch.int8
+        assert qt._qdata.shape == w.shape
+        assert qt._params.scale.numel() == 1
+        assert qt._params.scale.dtype == torch.float32
+
+    def test_activation_quantize_shape_dtype(self, seed):
+        """Activation path (is_weight=False): per-row scales [..., 1]."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+
+        x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+        qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=False)
+
+        assert qdata.dtype == torch.int8
+        assert qdata.shape == x.shape
+        assert params.scale.shape == (32, 1)
+
+    def test_weight_dequantize_dtype(self, seed):
+        """Dequantize restores original dtype."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+
+        for dtype in (torch.float16, torch.bfloat16):
+            w = torch.randn(64, 128, device="cuda", dtype=dtype)
+            qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+            dq = qt.dequantize()
+            assert dq.dtype == dtype
+            assert dq.shape == w.shape
+
+    def test_weight_roundtrip_error(self, seed):
+        """Roundtrip error stays within INT8 quantization tolerance."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+        dq = qt.dequantize()
+
+        rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+        assert rel_err.mean().item() < 0.02, f"Mean relative error too high: {rel_err.mean():.4f}"
+
+    def test_state_dict_tensors_keys(self, seed):
+        """state_dict_tensors returns '' and '_scale' keys."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+
+        w = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+        sd = TensorWiseINT8Layout.state_dict_tensors(qt._qdata, qt._params)
+
+        assert set(sd.keys()) == {"", "_scale"}
+        assert sd[""].dtype == torch.int8
+        assert sd["_scale"].numel() == 1
+
+    def test_supports_fast_matmul(self):
+        """supports_fast_matmul returns True on CUDA SM >= 7.5."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout
+
+        result = TensorWiseINT8Layout.supports_fast_matmul()
+        assert isinstance(result, bool)
+        sm = torch.cuda.get_device_capability()
+        if sm >= (7, 5):
+            assert result is True
+
+    def test_linear_dispatch(self, seed):
+        """aten.linear dispatch fires and produces correct shape/dtype."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        out = torch.nn.functional.linear(x, qt_w)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.bfloat16
+
+    def test_mm_dispatch(self, seed):
+        """aten.mm dispatch fires and produces correct shape."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        # mm: A [M,K] @ B [K,N] — store B as [K,N] so quantize/dequantize preserves shape
+        a = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+        qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
+
+        out = torch.mm(a, qt_b.dequantize())
+        assert out.shape == (8, 64)
+
+    def test_addmm_dispatch(self, seed):
+        """aten.addmm dispatch fires and produces correct shape/dtype."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(64, device="cuda", dtype=torch.bfloat16)
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        out = torch.nn.functional.linear(x, qt_w, bias)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.bfloat16
+
+    def test_public_api_quantize_tensorwise(self, seed):
+        """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_tensorwise(x)
+
+        assert q.dtype == torch.int8
+        assert q.shape == x.shape
+        assert scale.numel() == 1
+
+    def test_public_api_quantize_rowwise(self, seed):
+        """comfy_kitchen.quantize_int8_rowwise op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_rowwise(x)
+
+        assert q.dtype == torch.int8
+        assert q.shape == x.shape
+        assert scale.shape == (32, 1)
+
+    def test_public_api_dequantize_simple(self, seed):
+        """comfy_kitchen.dequantize_int8_simple op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_tensorwise(x)
+        dq = ck.dequantize_int8_simple(q, scale)
+
+        assert dq.dtype == torch.float32
+        assert dq.shape == x.shape
+
+    def test_public_api_int8_linear(self, seed):
+        """comfy_kitchen.int8_linear op is reachable."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        out = ck.int8_linear(x, w_int8, w_scale)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.bfloat16
 
 
 class TestFusedINT8GELU:
@@ -313,15 +499,21 @@ class TestFusedINT8GELU:
         fused_quant, fused_scale = int8_gelu(qx, s_x, block_size=128)
 
         # Dequantize both and compare
-        ref_dequant = dequantize_int8(ref_quant, ref_scale, block_size=128, output_dtype=torch.float32)
-        fused_dequant = dequantize_int8(fused_quant, fused_scale, block_size=128, output_dtype=torch.float32)
+        ref_dequant = dequantize_int8(
+            ref_quant, ref_scale, block_size=128, output_dtype=torch.float32
+        )
+        fused_dequant = dequantize_int8(
+            fused_quant, fused_scale, block_size=128, output_dtype=torch.float32
+        )
 
         # Use absolute error for GELU since values near zero cause numerical issues
         abs_error = (ref_dequant - fused_dequant).abs()
         # Normalize by the range of values
         value_range = ref_dequant.abs().max() + 1e-8
         normalized_error = abs_error / value_range
-        assert normalized_error.mean() < 0.1, f"Fused vs separate GELU error too high: {normalized_error.mean()}"
+        assert normalized_error.mean() < 0.1, (
+            f"Fused vs separate GELU error too high: {normalized_error.mean()}"
+        )
 
     def test_int8_gelu_3d_input(self, cuda_available, seed):
         """Test fused GELU with 3D input (batched)."""
@@ -341,4 +533,3 @@ class TestFusedINT8GELU:
         assert fused_quant.shape == (4, 64, 256)
         assert fused_quant.dtype == torch.int8
         assert fused_scale.shape == (4, 64, 2)
-

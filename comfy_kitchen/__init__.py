@@ -12,6 +12,7 @@ from .exceptions import (
     BackendNotImplementedError,
     NoCapableBackendError,
 )
+from .float_utils import from_blocked, swap_nibbles, to_blocked
 
 # Import registry and exceptions
 from .registry import registry
@@ -19,36 +20,46 @@ from .registry import registry
 __version__ = "0.1.0"
 
 __all__ = [
+    # Quantization / dequantization
+    "quantize_per_tensor_fp8",
+    "dequantize_per_tensor_fp8",
+    "quantize_nvfp4",
+    "dequantize_nvfp4",
+    "quantize_mxfp8",
+    "dequantize_mxfp8",
+    # INT8
+    "quantize_int8",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
+    "dequantize_int8",
+    "dequantize_int8_simple",
+    "scaled_mm_int8",
+    "mm_int8",
+    "int8_linear",
+    # Fused matmul
+    "scaled_mm_nvfp4",
+    "scaled_mm_mxfp8",
+    # Attention
+    "sage_sdpa",
+    "sage_is_available",
+    # Positional encoding
+    "apply_rope",
+    "apply_rope1",
+    # Utilities
+    "swap_nibbles",
+    "to_blocked",
+    "from_blocked",
+    # Backend configuration
+    "list_backends",
+    "set_backend_priority",
+    "enable_backend",
+    "disable_backend",
+    "use_backend",
     # Exceptions
     "BackendError",
     "BackendNotFoundError",
     "BackendNotImplementedError",
     "NoCapableBackendError",
-    # Core functions
-    "apply_rope",
-    "apply_rope1",
-    "dequantize_int8",
-    "dequantize_int8_simple",
-    "dequantize_mxfp8",
-    "dequantize_nvfp4",
-    "dequantize_per_tensor_fp8",
-    "int8_linear",
-    "mm_int8",
-    # Backend configuration
-    "disable_backend",
-    "enable_backend",
-    "list_backends",
-    "quantize_int8",
-    "quantize_int8_rowwise",
-    "quantize_int8_tensorwise",
-    "quantize_mxfp8",
-    "quantize_nvfp4",
-    "quantize_per_tensor_fp8",
-    "scaled_mm_int8",
-    "scaled_mm_mxfp8",
-    "scaled_mm_nvfp4",
-    "set_backend_priority",
-    "use_backend",
 ]
 
 
@@ -100,6 +111,7 @@ def quantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     epsilon: float = 0.0,
     pad_16x: bool = False,
+    hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to NVFP4 format with block-wise scaling.
 
@@ -108,11 +120,14 @@ def quantize_nvfp4(
         per_tensor_scale: Global scale factor
         epsilon: Epsilon for numerical stability
         pad_16x: If True, implicit zero-padding is applied to make dimensions divisible by 16
+        hi_first: Nibble packing order. If True (default), the even-indexed element
+                  is stored in the high nibble of each packed byte. If False, the
+                  even-indexed element is stored in the low nibble.
 
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x)
+    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x, hi_first)
 
 
 def dequantize_nvfp4(
@@ -120,6 +135,7 @@ def dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
 ) -> torch.Tensor:
     """Dequantize tensor from NVFP4 format with block-wise scaling.
 
@@ -128,12 +144,17 @@ def dequantize_nvfp4(
         per_tensor_scale: Global scale factor
         block_scales: Block scales in swizzled layout (float8_e4m3fn)
         output_type: Target output dtype (float32, float16, or bfloat16)
+        hi_first: Nibble packing order. Must match the packing order used
+                  during quantization. If True (default), the even-indexed
+                  element is in the high nibble.
 
     Returns:
         Dequantized tensor in specified output format
     """
     dtype_code = DTYPE_TO_CODE[output_type]
-    return torch.ops.comfy_kitchen.dequantize_nvfp4(qx, per_tensor_scale, block_scales, dtype_code)
+    return torch.ops.comfy_kitchen.dequantize_nvfp4(
+        qx, per_tensor_scale, block_scales, dtype_code, hi_first
+    )
 
 
 def scaled_mm_nvfp4(
@@ -169,8 +190,7 @@ def scaled_mm_nvfp4(
         out_dtype = torch.bfloat16
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
-        a, b, tensor_scale_a, tensor_scale_b,
-        block_scale_a, block_scale_b, bias, dtype_code, alpha
+        a, b, tensor_scale_a, tensor_scale_b, block_scale_a, block_scale_b, bias, dtype_code, alpha
     )
 
 
@@ -260,9 +280,7 @@ def apply_rope(
     return torch.ops.comfy_kitchen.apply_rope(xq, xk, freqs_cis)
 
 
-def apply_rope1(
-    x: torch.Tensor, freqs_cis: torch.Tensor
-) -> torch.Tensor:
+def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply Rotary Position Embedding (RoPE) to a single tensor.
 
     Args:
@@ -275,9 +293,41 @@ def apply_rope1(
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
 
 
+def sage_is_available() -> bool:
+    """Return True if SageAttention CUDA kernels can run on the current device."""
+    from .sage_attention import is_available
+
+    return is_available()
+
+
+def sage_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+    smooth_k: bool = True,
+) -> torch.Tensor:
+    """SageAttention scaled dot-product attention.
+
+    Args:
+        q: Query tensor [B, H_Q, N_Q, D] (fp16 or bf16)
+        k: Key tensor [B, H_K, N_K, D]
+        v: Value tensor [B, H_K, N_K, D]
+        is_causal: Whether to apply causal masking
+        smooth_k: Whether to subtract per-head K mean before quantisation
+
+    Returns:
+        Output tensor [B, H_Q, N_Q, D] (same dtype as q)
+    """
+    from .sage_attention import sage_sdpa as _sage_sdpa
+
+    return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k)
+
+
 # =============================================================================
 # INT8 API Functions
 # =============================================================================
+
 
 def quantize_int8(
     x: torch.Tensor,
@@ -285,12 +335,12 @@ def quantize_int8(
     is_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise INT8 quantization.
-    
+
     Args:
         x: Input tensor.
         block_size: Quantization block size.
         is_weight: If True, use 2D blocking for weights.
-        
+
     Returns:
         Tuple of (qdata, scale)
     """
@@ -304,13 +354,13 @@ def dequantize_int8(
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Block-wise INT8 dequantization.
-    
+
     Args:
         qx: Quantized INT8 tensor.
         scale: Per-block scaling factors.
         block_size: Block size used for quantization.
         output_dtype: Target output dtype.
-        
+
     Returns:
         Dequantized tensor.
     """
@@ -327,7 +377,7 @@ def scaled_mm_int8(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """INT8 matrix multiplication with block-wise scaling.
-    
+
     Args:
         a: INT8 activations.
         b: INT8 weights.
@@ -335,7 +385,7 @@ def scaled_mm_int8(
         scale_b: Weight scales.
         bias: Optional bias vector.
         out_dtype: Output dtype.
-        
+
     Returns:
         Result tensor.
     """
@@ -360,7 +410,9 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
-    return torch.ops.comfy_kitchen.mm_int8(a, b)
+    from .backends.eager.quantization import mm_int8 as _mm_int8
+
+    return _mm_int8(a, b)
 
 
 def int8_linear(
@@ -371,14 +423,14 @@ def int8_linear(
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
-    
+
     Args:
         x: Input tensor.
         weight: INT8 weight tensor.
         weight_scale: Scalar weight scale.
         bias: Optional bias.
         out_dtype: Output dtype.
-        
+
     Returns:
         Result tensor.
     """
