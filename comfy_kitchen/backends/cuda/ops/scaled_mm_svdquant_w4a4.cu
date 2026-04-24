@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Kitchen CUDA SVDQuant W4A4 int4 GEMM with per-group dequant.

@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared device helpers for SVDQuant W4A4 kernels.
