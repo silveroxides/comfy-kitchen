@@ -23,7 +23,22 @@ from comfy_kitchen.backends.eager.svdquant import (
     _unpack_uint4_row_major,
 )
 
-from .conftest import assert_values_close, get_capable_backends
+from .conftest import assert_values_close
+
+_CUDA = torch.cuda.is_available()
+_SM80 = _CUDA and torch.cuda.get_device_capability() >= (8, 0)
+
+try:
+    from comfy_kitchen.backends.cuda import _EXT_AVAILABLE
+except ImportError:
+    _EXT_AVAILABLE = False
+
+_SVDQUANT_READY = _SM80 and _EXT_AVAILABLE
+
+requires_svdquant_ext = pytest.mark.skipif(
+    not _SVDQUANT_READY,
+    reason="Requires SM80+ GPU and compiled CUDA extension",
+)
 
 
 _GROUP = 64
@@ -48,10 +63,9 @@ class TestQuantizerClampContract:
         assert _INT4_MAX == 7, f"_INT4_MAX drifted to {_INT4_MAX}"
         assert _UINT4_MAX == 15, f"_UINT4_MAX drifted to {_UINT4_MAX}"
 
+    @requires_svdquant_ext
     @pytest.mark.parametrize("scale_factor", [0.5, 3.0, 100.0])
-    def test_signed_clamp_normal_and_extreme(self, cuda_available, seed, scale_factor):
-        if not cuda_available:
-            pytest.skip("CUDA required for scaled_mm dispatch")
+    def test_signed_clamp_normal_and_extreme(self, seed, scale_factor):
         K = 128
         x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda") * scale_factor
         smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
@@ -68,12 +82,11 @@ class TestQuantizerClampContract:
         )
         assert q_vals.max().item() <= _INT4_MAX
 
-    def test_signed_clamp_forced_negative_outlier(self, cuda_available, seed):
+    @requires_svdquant_ext
+    def test_signed_clamp_forced_negative_outlier(self, seed):
         """Inject an extreme negative outlier that would clamp to -8 under the
         broken [-8, 7] contract. The fix keeps it at -7.
         """
-        if not cuda_available:
-            pytest.skip("CUDA required for scaled_mm dispatch")
         K = 128
         x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda") * 5.0
         x[0, 0] = -100.0  # forces negative saturation
@@ -89,10 +102,9 @@ class TestQuantizerClampContract:
         assert (q_vals != -8).all().item(), "eager emitted -8, regressed from absmax/7 contract"
         assert q_vals.min().item() == -_INT4_MAX  # the outlier did saturate
 
-    def test_no_neg8_at_scale(self, cuda_available, seed):
+    @requires_svdquant_ext
+    def test_no_neg8_at_scale(self, seed):
         """Bulk test across many samples."""
-        if not cuda_available:
-            pytest.skip("CUDA required for scaled_mm dispatch")
         K = 128
         x = torch.randn(256, K, dtype=torch.bfloat16, device="cuda") * 3.0
         smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
@@ -106,10 +118,9 @@ class TestQuantizerClampContract:
         neg8 = (q_vals == -8).sum().item()
         assert neg8 == 0, f"{neg8} values emitted as -8 across {q_vals.numel()} samples"
 
-    def test_unsigned_clamp_range(self, cuda_available, seed):
+    @requires_svdquant_ext
+    def test_unsigned_clamp_range(self, seed):
         """Unsigned path: emission must be in [0, 15]."""
-        if not cuda_available:
-            pytest.skip("CUDA required for scaled_mm dispatch")
         K = 128
         # Non-negative input (simulates post-GELU + shift)
         x = torch.rand(4, K, dtype=torch.bfloat16, device="cuda") * 3.0 + 0.01
@@ -141,11 +152,6 @@ class TestActUnsignedDispatch:
     correctly end-to-end.
     """
 
-    @pytest.fixture
-    def _cuda_required(self, cuda_available):
-        if not cuda_available:
-            pytest.skip("CUDA required for int4 MMA kernels")
-
     def _run(self, act_unsigned):
         M, N, K, R = 16, 8, 64, 16
         q_act = torch.full((M, K // 2), 0xFF, dtype=torch.uint8, device="cuda").view(torch.int8)
@@ -161,13 +167,15 @@ class TestActUnsignedDispatch:
                 lora_act_in=lai, lora_up=lu, bias=b, act_unsigned=act_unsigned,
             )
 
-    def test_signed_mma_gives_minus_64(self, _cuda_required, seed):
+    @requires_svdquant_ext
+    def test_signed_mma_gives_minus_64(self, seed):
         out = self._run(act_unsigned=False)
         # Allow tiny tolerance for fp16 accumulation rounding
         assert abs(out[0, 0].item() - (-64.0)) < 1.0
         assert (out == out[0, 0]).all().item()
 
-    def test_unsigned_mma_gives_plus_960(self, _cuda_required, seed):
+    @requires_svdquant_ext
+    def test_unsigned_mma_gives_plus_960(self, seed):
         out = self._run(act_unsigned=True)
         assert abs(out[0, 0].item() - 960.0) < 5.0
         assert (out == out[0, 0]).all().item()
@@ -192,15 +200,11 @@ class TestLoraXSeparation:
     """
 
     @pytest.mark.parametrize("backend", ["eager", "cuda"])
-    def test_lora_x_none_defaults_to_x(self, cuda_available, seed, backend):
+    def test_lora_x_none_defaults_to_x(self, seed, backend):
         """Explicit lora_x=x is indistinguishable from lora_x=None (default)."""
-        if backend == "cuda" and not cuda_available:
-            pytest.skip("CUDA backend not available")
-        device = "cuda" if cuda_available else "cpu"
-        if backend == "eager" and device == "cpu":
-            pass  # eager runs on CPU
-        elif device != "cuda":
-            pytest.skip(f"backend {backend} needs cuda")
+        if backend == "cuda" and not _SVDQUANT_READY:
+            pytest.skip("Requires SM80+ GPU and compiled CUDA extension")
+        device = "cuda" if backend == "cuda" else ("cuda" if _CUDA else "cpu")
 
         K, R = 128, 16
         x = torch.randn(4, K, dtype=torch.bfloat16, device=device)
@@ -219,7 +223,7 @@ class TestLoraXSeparation:
         assert_values_close(la1, la2, rtol=0.0, atol=0.0, name=f"{backend} lora_act")
 
     @pytest.mark.parametrize("backend", ["eager", "cuda"])
-    def test_lora_x_separate_uses_raw_for_lora(self, cuda_available, seed, backend):
+    def test_lora_x_separate_uses_raw_for_lora(self, seed, backend):
         """Pass a pre-shifted x as main input + raw x as lora_x. LoRA output
         must follow the raw lora_x, proving the kwarg is wired through and not
         silently falling back to the shifted x. Accuracy check uses a fp32
@@ -227,11 +231,9 @@ class TestLoraXSeparation:
         not fp32-accumulate — do not interpret this as a cross-backend bit-parity
         test).
         """
-        if backend == "cuda" and not cuda_available:
-            pytest.skip("CUDA backend not available")
-        device = "cuda" if cuda_available else "cpu"
-        if backend != "eager" and device != "cuda":
-            pytest.skip(f"backend {backend} needs cuda")
+        if backend == "cuda" and not _SVDQUANT_READY:
+            pytest.skip("Requires SM80+ GPU and compiled CUDA extension")
+        device = "cuda" if backend == "cuda" else ("cuda" if _CUDA else "cpu")
 
         K, R = 128, 16
         raw_x = torch.randn(4, K, dtype=torch.bfloat16, device=device) * 0.5
@@ -276,14 +278,13 @@ class TestSvdquantSmoke:
     reasonable outputs on matched random data (not a nunchaku bit-parity test —
     that's an integration concern)."""
 
+    @requires_svdquant_ext
     @pytest.mark.parametrize("M,N,K,R", [
         (16, 8, 64, 16),     # one MMA
         (64, 32, 128, 16),
         (256, 128, 512, 32),
     ])
-    def test_signed_forward_runs(self, cuda_available, seed, M, N, K, R):
-        if not cuda_available:
-            pytest.skip("CUDA required")
+    def test_signed_forward_runs(self, seed, M, N, K, R):
         device = "cuda"
         x = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.3
         smooth = torch.ones(K, dtype=torch.bfloat16, device=device) * 1.0
