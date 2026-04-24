@@ -88,6 +88,10 @@ endif()
 # Optimization flags
 list(APPEND CUDA_NVCC_FLAGS -O3)
 
+# Emit ptxas register/spill stats during build (useful for tuning the int4
+# kernels). No file-level reg cap — each kernel manages occupancy itself.
+list(APPEND CUDA_NVCC_FLAGS -Xptxas=-v)
+
 # Line info for profiling (Nsight Compute/Systems)
 # Can be enabled via setup.py --lineinfo
 if(NOT DEFINED COMFY_ENABLE_LINEINFO)
@@ -107,6 +111,8 @@ set(CUDA_SOURCES
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
     ops/apply_rope.cu
+    ops/quantize_svdquant_w4a4.cu
+    ops/scaled_mm_svdquant_w4a4.cu
     sage_attention/quant_v_fp8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu

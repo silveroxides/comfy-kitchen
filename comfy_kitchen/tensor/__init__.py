@@ -14,6 +14,7 @@ from .int8 import BlockWiseINT8Layout, TensorWiseINT8Layout
 from .mxfp8 import TensorCoreMXFP8Layout
 from .mxfp8_hybrid import HybridMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
+from .svdquant_w4a4 import TensorCoreSVDQuantW4A4Layout
 
 __all__ = [
     "BaseLayoutParams",
@@ -24,6 +25,7 @@ __all__ = [
     "TensorCoreFP8Layout",
     "TensorCoreMXFP8Layout",
     "TensorCoreNVFP4Layout",
+    "TensorCoreSVDQuantW4A4Layout",
     "TensorWiseINT8Layout",
     "dequantize_args",
     "get_cuda_capability",
@@ -38,4 +40,4 @@ register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
 register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
 register_layout_class("TensorCoreNVFP4Layout", TensorCoreNVFP4Layout)
-
+register_layout_class("TensorCoreSVDQuantW4A4Layout", TensorCoreSVDQuantW4A4Layout)

@@ -6,6 +6,7 @@ __all__ = [
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "gemv_awq_w4a16",
     "int8_linear",
     "mm_int8",
     "quantize_int8",
@@ -14,11 +15,14 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "quantize_svdquant_w4a4",
     "scaled_mm_int8",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
+    "scaled_mm_svdquant_w4a4",
 ]
 
+from .awq import gemv_awq_w4a16
 from .quantization import (
     dequantize_int8,
     dequantize_int8_simple,
@@ -38,6 +42,7 @@ from .quantization import (
     scaled_mm_nvfp4,
 )
 from .rope import apply_rope, apply_rope1
+from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
 def _build_constraints() -> dict:
@@ -197,6 +202,49 @@ def _build_constraints() -> dict:
             params={
                 "a": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "b": ParamConstraint(dtypes=frozenset({torch.int8})),
+            },
+            default_devices=all_devices,
+        ),
+        # SVDQuant W4A4 + AWQ W4A16
+        "quantize_svdquant_w4a4": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "smooth": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+                "lora_down": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "scaled_mm_svdquant_w4a4": FunctionConstraints(
+            params={
+                "act": ParamConstraint(
+                    dtypes=frozenset({torch.int8, torch.uint8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "wgt": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "ascales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "lora_act_in": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "lora_up": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            },
+            default_devices=all_devices,
+        ),
+        "gemv_awq_w4a16": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "wzeros": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
             },
             default_devices=all_devices,
         ),

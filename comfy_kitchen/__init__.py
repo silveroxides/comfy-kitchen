@@ -39,6 +39,10 @@ __all__ = [
     # Fused matmul
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
+    # SVDQuant W4A4 + AWQ W4A16
+    "quantize_svdquant_w4a4",
+    "scaled_mm_svdquant_w4a4",
+    "gemv_awq_w4a16",
     # Attention
     "sage_sdpa",
     "sage_is_available",
@@ -261,6 +265,108 @@ def scaled_mm_mxfp8(
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_mxfp8(
         a, b, block_scale_a, block_scale_b, bias, dtype_code
+    )
+
+
+def quantize_svdquant_w4a4(
+    x: torch.Tensor,
+    smooth: torch.Tensor,
+    lora_down: torch.Tensor,
+    pad_size: int = 256,
+    act_unsigned: bool = False,
+    lora_x: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize activations to int4 with smoothing + LoRA down projection.
+
+    Args:
+        x: (M, K) bf16/fp16 main-path input (caller pre-shifts if unsigned path).
+        smooth: (K,) smoothing factor applied before quantization.
+        lora_down: (K, R) low-rank down projection weight.
+        pad_size: pad M to multiple of this value (default 256).
+        act_unsigned: if True, quantize into uint4 [0, 15] (scale=max/15) for u4
+            MMA downstream. Caller must ensure x is non-negative — the shift
+            constant is a model-topology concern, not part of this op.
+        lora_x: (M, K) optional pre-shift activation for LoRA. Defaults to x.
+            Pass raw (un-shifted) x when x has been pre-shifted for unsigned path.
+
+    Returns:
+        (quantized_x uint8 [M_pad, K//2], ascales [K//64, M_pad], lora_act fp32 [M_pad, R])
+
+    Note: the returned lora_act is a fp32 buffer, but under the CUDA backend it
+    carries bf16-matmul precision (the output of a bf16 × bf16 torch matmul
+    upcast to fp32), not fp32-accumulated precision. The eager backend runs the
+    LoRA matmul in fp32 for numerical stability, which makes it a high-precision
+    reference rather than a bit-parity oracle for the CUDA path.
+    """
+    return torch.ops.comfy_kitchen.quantize_svdquant_w4a4(
+        x, smooth, lora_down, pad_size, act_unsigned, lora_x,
+    )
+
+
+def scaled_mm_svdquant_w4a4(
+    act: torch.Tensor,
+    wgt: torch.Tensor,
+    ascales: torch.Tensor,
+    wscales: torch.Tensor,
+    lora_act_in: torch.Tensor,
+    lora_up: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    act_unsigned: bool = False,
+) -> torch.Tensor:
+    """SVDQuant W4A4 int4 GEMM + LoRA-up + bias.
+
+    Computes out = int4_matmul(act, wgt, ascales, wscales) + lora_act_in @ lora_up^T + bias.
+    The int4 MMA + per-group dequant happens in one CUDA kernel. LoRA-up and
+    bias are applied in the wrapper (bf16 addmm_ into the bf16/fp16 output
+    buffer — faster than kernel fusion for small R, at the cost of the fp32
+    precision carried by lora_act_in). If LoRA-up precision ever becomes a
+    quality blocker, the correct next step is a dedicated cuBLASLt helper with
+    16-bit operand + fp32 accumulate (matches nunchaku's lora.cuh), not a
+    Python-level .float() upcast which would undo the memory/perf win.
+
+    Args:
+        act: (M, K//2) uint8 packed activations from quantize_svdquant_w4a4.
+        wgt: (N, K//2) int8 packed weights (natural row-major).
+        ascales: (K//64, M) activation scales.
+        wscales: (K//64, N) weight scales.
+        lora_act_in: (M, R) fp32 LoRA activations from quantize step. Note:
+            the fp32 precision is dropped at the bf16 addmm_ below.
+        lora_up: (N, R) LoRA up projection weight.
+        bias: optional (N,) bias.
+        act_unsigned: if True, activations are interpreted as unsigned [0,15] by
+            u4.s4 MMA (for post-GELU+shift fc2). Caller pre-shifts.
+
+    Returns:
+        (M, N) output tensor (same dtype as lora_up).
+    """
+    return torch.ops.comfy_kitchen.scaled_mm_svdquant_w4a4(
+        act, wgt, ascales, wscales, lora_act_in, lora_up, bias, act_unsigned
+    )
+
+
+def gemv_awq_w4a16(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    group_size: int = 64,
+) -> torch.Tensor:
+    """AWQ W4A16 quantized GEMV (for modulation-style layers called with small batch).
+
+    Args:
+        x: (..., K) bf16/fp16 input.
+        qweight: (N//4, K//2) int32 packed weight.
+        wscales: (K//group_size, N) per-group scales.
+        wzeros: (K//group_size, N) per-group zero points.
+        bias: optional (N,) bias.
+        group_size: quantization group size.
+
+    Returns:
+        (..., N) output tensor.
+    """
+    return torch.ops.comfy_kitchen.gemv_awq_w4a16(
+        x, qweight, wscales, wzeros, bias, group_size
     )
 
 
