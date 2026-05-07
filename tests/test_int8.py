@@ -472,6 +472,73 @@ class TestTensorWiseINT8Layout:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+    @pytest.mark.parametrize("backend", get_capable_backends("int8_linear", "cuda"))
+    def test_int8_linear_correctness(self, seed, backend):
+        """Check int8_linear parity across all capable backends."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(128, 256, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+        bias = torch.randn(64, device="cuda", dtype=torch.float16)
+
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            ref_out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+
+        with ck.registry.use_backend(backend):
+            out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+
+        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}", max_mismatch_ratio=0.01)
+
+    def test_public_api_quantize_tensorwise(self, seed):
+        """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_tensorwise(x)
+
+        assert q.dtype == torch.int8
+        assert q.shape == x.shape
+        assert scale.numel() == 1
+
+    def test_public_api_quantize_rowwise(self, seed):
+        """comfy_kitchen.quantize_int8_rowwise op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_rowwise(x)
+
+        assert q.dtype == torch.int8
+        assert q.shape == x.shape
+        assert scale.shape == (32, 1)
+
+    def test_public_api_dequantize_simple(self, seed):
+        """comfy_kitchen.dequantize_int8_simple op is reachable."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        q, scale = ck.quantize_int8_tensorwise(x)
+        dq = ck.dequantize_int8_simple(q, scale)
+
+        assert dq.dtype == torch.float32
+        assert dq.shape == x.shape
+
+    def test_public_api_int8_linear(self, seed):
+        """comfy_kitchen.int8_linear op is reachable."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        out = ck.int8_linear(x, w_int8, w_scale)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.bfloat16
+
 
 class TestTensorWisePublicAPI:
     @pytest.fixture

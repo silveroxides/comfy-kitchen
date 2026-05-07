@@ -430,6 +430,8 @@ def _handle_int8_addmm(qt, args, kwargs):
 def _handle_int8_linear_tensorwise(qt, args, kwargs):
     """INT8 linear for tensor-wise layout: output = input @ weight.T + bias."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
+    import comfy_kitchen as ck
 
     input_tensor = args[0]
     weight = args[1]
@@ -446,34 +448,16 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    # Try Triton kernel first
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
-        )
-    except Exception as e:
-        logger.debug(f"Triton INT8 scaled_mm failed: {e}, falling back to eager")
-
-    # Fallback to eager backend
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
-        )
-    except Exception as e:
-        logger.debug(f"Eager INT8 scaled_mm failed: {e}, falling back to dequantization")
-
-    # Final fallback
-    return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
+    )
 
 
 @register_layout_op(torch.ops.aten.mm.default, TensorWiseINT8Layout)
 def _handle_int8_mm_tensorwise(qt, args, kwargs):
     """INT8 matrix multiplication for tensor-wise layout: output = a @ b."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
 
     input_tensor = args[0]
     weight = args[1]
@@ -490,31 +474,16 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
 
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
-        )
-    except Exception as e:
-        logger.debug(f"Triton INT8 mm failed: {e}, falling back to eager")
-
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
-        )
-    except Exception as e:
-        logger.debug(f"Eager INT8 mm failed: {e}, falling back to dequantization")
-
-    return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, None, out_dtype
+    )
 
 
 @register_layout_op(torch.ops.aten.addmm.default, TensorWiseINT8Layout)
 def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     """INT8 addmm for tensor-wise layout: output = bias + input @ weight."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
 
     bias = args[0]
     input_tensor = args[1]
@@ -529,105 +498,6 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
-        )
-    except (ImportError, RuntimeError):
-        pass
-
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
-        )
-    except (ImportError, RuntimeError):
-        pass
-
-    return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
-
-
-# =============================================================================
-# INT8 Shape Operations
-# =============================================================================
-
-
-@register_layout_op(torch.ops.aten.t.default, BlockWiseINT8Layout)
-def _handle_int8_transpose(qt, args, kwargs):
-    """Handle transpose for INT8 tensors.
-
-    For weights with 2D blocking, we need to transpose the scale tensor too.
-    """
-    from .base import QuantizedTensor
-
-    input_tensor = args[0]
-    if not isinstance(input_tensor, QuantizedTensor):
-        return torch.ops.aten.t.default(*args, **kwargs)
-
-    # Transpose the quantized data
-    new_qdata = input_tensor._qdata.t().contiguous()
-
-    # Transpose scale if it's 2D (weight tensor)
-    old_scale = input_tensor._params.scale
-    if old_scale.dim() == 2:
-        new_scale = old_scale.t().contiguous()
-    else:
-        new_scale = old_scale
-
-    old_shape = input_tensor._params.orig_shape
-    new_params = BlockWiseINT8Layout.Params(
-        scale=new_scale,
-        orig_dtype=input_tensor._params.orig_dtype,
-        orig_shape=(old_shape[1], old_shape[0]) if len(old_shape) == 2 else old_shape,
-        block_size=input_tensor._params.block_size,
-        is_weight=input_tensor._params.is_weight,
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
     )
-    return QuantizedTensor(new_qdata, "BlockWiseINT8Layout", new_params)
-
-
-def _make_int8_view_handler(aten_op):
-    """Factory for shape-changing operations that preserve INT8 data.
-
-    INT8 is not packed (1:1 element mapping), so view/reshape work directly.
-    However, for block-wise quantization, view operations may break block alignment.
-    """
-    from .base import QuantizedTensor
-
-    def handler(qt, args, kwargs):
-        input_tensor = args[0]
-        if not isinstance(input_tensor, QuantizedTensor):
-            return aten_op(*args, **kwargs)
-
-        # For activation tensors (1D blocking along K), view is generally safe
-        # For weight tensors (2D blocking), view may break alignment
-        if input_tensor._params.is_weight:
-            logger.warning(
-                f"INT8 view operation on weight tensor may break block alignment. "
-                f"Falling back to dequantization."
-            )
-            return aten_op(input_tensor.dequantize(), *args[1:], **kwargs)
-
-        # Apply view to quantized data
-        new_qdata = aten_op(input_tensor._qdata, *args[1:], **kwargs)
-
-        # Scale shape depends on the new data shape
-        # For now, keep existing scale (assumes view preserves last dimension blocks)
-        new_params = BlockWiseINT8Layout.Params(
-            scale=input_tensor._params.scale,
-            orig_dtype=input_tensor._params.orig_dtype,
-            orig_shape=tuple(new_qdata.shape),
-            block_size=input_tensor._params.block_size,
-            is_weight=False,  # After view, treat as activation
-        )
-        return QuantizedTensor(new_qdata, "BlockWiseINT8Layout", new_params)
-
-    return handler
-
-
-# Register view operation
-register_layout_op(torch.ops.aten.view.default, BlockWiseINT8Layout)(
-    _make_int8_view_handler(torch.ops.aten.view.default)
-)

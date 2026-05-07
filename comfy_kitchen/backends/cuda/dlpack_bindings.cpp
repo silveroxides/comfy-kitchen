@@ -398,45 +398,6 @@ void quantize_mxfp8(
         stream);
 }
 
-// Nanobind wrapper for cublas_gemm_int8
-void cublas_gemm_int8(
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,
-    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> c,
-    nb::ndarray<nb::device::cuda> workspace,
-    uintptr_t stream_ptr) {
-
-    auto& runtime = comfy::CublasLtRuntime::instance();
-    if (!runtime.is_available()) {
-        throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
-    }
-
-    // a is [M, K], b is [K, N], c is [M, N]
-    int64_t M = a.shape(0);
-    int64_t K = a.shape(1);
-    int64_t K_b = b.shape(0);
-    int64_t N = b.shape(1);
-
-    if (K != K_b) {
-        throw std::runtime_error("Matrix K dimensions do not match");
-    }
-
-    if (c.shape(0) != M || c.shape(1) != N) {
-        throw std::runtime_error("Output matrix C shape does not match");
-    }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-
-    launch_cublas_gemm_int8_kernel(
-        a.data(),
-        b.data(),
-        c.data(),
-        M, N, K,
-        workspace.data(),
-        workspace.size() > 0 ? (int64_t)workspace.size() : 0,
-        stream);
-}
-
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
 void apply_rope(
     nb::ndarray<nb::device::cuda> xq,
@@ -784,11 +745,11 @@ void cublas_gemm_int8(
         throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
     }
 
-    // a is [M, K], b is [K, N], c is [M, N]
+    // a is [M, K], b is [N, K], c is [M, N]
     int64_t M = a.shape(0);
     int64_t K = a.shape(1);
-    int64_t K_b = b.shape(0);
-    int64_t N = b.shape(1);
+    int64_t N = b.shape(0);
+    int64_t K_b = b.shape(1);
 
     if (K != K_b) {
         throw std::runtime_error("Matrix K dimensions do not match");
