@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for INT8 block-wise quantization."""
+"""Tests for INT8 quantization."""
 
 import pytest
 import torch
@@ -13,7 +13,7 @@ from .conftest import (
 
 
 # =============================================================================
-# INT8 Quantization Tests
+# INT8 Block-wise Quantization Tests
 # =============================================================================
 
 
@@ -130,11 +130,6 @@ class TestScaledMMINT8:
             assert result.shape == ref.shape, f"{backend_name}: shape mismatch"
 
 
-# =============================================================================
-# BlockWiseINT8Layout Tests
-# =============================================================================
-
-
 class TestBlockWiseINT8Layout:
     """Tests for BlockWiseINT8Layout QuantizedTensor integration."""
 
@@ -175,11 +170,6 @@ class TestBlockWiseINT8Layout:
         assert state_dict[""].dtype == torch.int8
 
 
-# =============================================================================
-# Cross-Backend Consistency Tests
-# =============================================================================
-
-
 class TestINT8CrossBackend:
     """Test consistency between Triton and eager backends."""
 
@@ -215,11 +205,6 @@ class TestINT8CrossBackend:
         assert_values_close(
             eager_s, triton_s, rtol=1e-4, atol=1e-6, name="scales (triton vs eager)"
         )
-
-
-# =============================================================================
-# Fused INT8 GEMM + Quantization Tests
-# =============================================================================
 
 
 class TestFusedINT8GEMMQuant:
@@ -301,8 +286,75 @@ class TestFusedINT8GEMMQuant:
         assert fused_scale.shape == (m, n // 128)
 
 
+class TestFusedINT8GELU:
+    """Tests for fused INT8 GELU activation."""
+
+    @pytest.fixture
+    def cuda_available(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_int8_gelu_correctness(self, cuda_available, seed):
+        """Test fused GELU produces correct results."""
+        from comfy_kitchen.backends.triton.quantization import (
+            quantize_int8,
+            dequantize_int8,
+            int8_gelu,
+        )
+
+        # Create test data
+        x = torch.randn(256, 512, device="cuda", dtype=torch.float32)
+
+        # Quantize input
+        qx, s_x = quantize_int8(x, block_size=128, is_weight=False)
+
+        # Reference: dequantize -> GELU -> quantize
+        x_dequant = dequantize_int8(qx, s_x, block_size=128, output_dtype=torch.float32)
+        ref_gelu = torch.nn.functional.gelu(x_dequant)
+        ref_quant, ref_scale = quantize_int8(ref_gelu, block_size=128, is_weight=False)
+
+        # Fused GELU
+        fused_quant, fused_scale = int8_gelu(qx, s_x, block_size=128)
+
+        # Dequantize both and compare
+        ref_dequant = dequantize_int8(
+            ref_quant, ref_scale, block_size=128, output_dtype=torch.float32
+        )
+        fused_dequant = dequantize_int8(
+            fused_quant, fused_scale, block_size=128, output_dtype=torch.float32
+        )
+
+        # Use absolute error for GELU since values near zero cause numerical issues
+        abs_error = (ref_dequant - fused_dequant).abs()
+        # Normalize by the range of values
+        value_range = ref_dequant.abs().max() + 1e-8
+        normalized_error = abs_error / value_range
+        assert normalized_error.mean() < 0.1, (
+            f"Fused vs separate GELU error too high: {normalized_error.mean()}"
+        )
+
+    def test_int8_gelu_3d_input(self, cuda_available, seed):
+        """Test fused GELU with 3D input (batched)."""
+        from comfy_kitchen.backends.triton.quantization import (
+            quantize_int8,
+            int8_gelu,
+        )
+
+        # 3D input: (batch, seq, hidden)
+        x = torch.randn(4, 64, 256, device="cuda", dtype=torch.float32)
+        qx, s_x = quantize_int8(x.reshape(-1, 256), block_size=128, is_weight=False)
+        qx = qx.reshape(4, 64, 256)
+        s_x = s_x.reshape(4, 64, 2)
+
+        fused_quant, fused_scale = int8_gelu(qx, s_x, block_size=128)
+
+        assert fused_quant.shape == (4, 64, 256)
+        assert fused_quant.dtype == torch.int8
+        assert fused_scale.shape == (4, 64, 2)
+
+
 # =============================================================================
-# TensorWiseINT8Layout Tests
+# INT8 Tensor-wise Quantization Tests
 # =============================================================================
 
 
@@ -420,9 +472,16 @@ class TestTensorWiseINT8Layout:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+
+class TestTensorWisePublicAPI:
+    @pytest.fixture
+    def seed(self):
+        torch.manual_seed(42)
+
     def test_public_api_quantize_tensorwise(self, seed):
         """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
         import comfy_kitchen as ck
+        import torch
 
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_tensorwise(x)
@@ -434,6 +493,7 @@ class TestTensorWiseINT8Layout:
     def test_public_api_quantize_rowwise(self, seed):
         """comfy_kitchen.quantize_int8_rowwise op is reachable."""
         import comfy_kitchen as ck
+        import torch
 
         x = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_rowwise(x)
@@ -445,6 +505,7 @@ class TestTensorWiseINT8Layout:
     def test_public_api_dequantize_simple(self, seed):
         """comfy_kitchen.dequantize_int8_simple op is reachable."""
         import comfy_kitchen as ck
+        import torch
 
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_tensorwise(x)
@@ -457,6 +518,7 @@ class TestTensorWiseINT8Layout:
         """comfy_kitchen.int8_linear op is reachable."""
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+        import torch
 
         x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
@@ -466,70 +528,3 @@ class TestTensorWiseINT8Layout:
 
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
-
-
-class TestFusedINT8GELU:
-    """Tests for fused INT8 GELU activation."""
-
-    @pytest.fixture
-    def cuda_available(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-    def test_int8_gelu_correctness(self, cuda_available, seed):
-        """Test fused GELU produces correct results."""
-        from comfy_kitchen.backends.triton.quantization import (
-            quantize_int8,
-            dequantize_int8,
-            int8_gelu,
-        )
-
-        # Create test data
-        x = torch.randn(256, 512, device="cuda", dtype=torch.float32)
-
-        # Quantize input
-        qx, s_x = quantize_int8(x, block_size=128, is_weight=False)
-
-        # Reference: dequantize -> GELU -> quantize
-        x_dequant = dequantize_int8(qx, s_x, block_size=128, output_dtype=torch.float32)
-        ref_gelu = torch.nn.functional.gelu(x_dequant)
-        ref_quant, ref_scale = quantize_int8(ref_gelu, block_size=128, is_weight=False)
-
-        # Fused GELU
-        fused_quant, fused_scale = int8_gelu(qx, s_x, block_size=128)
-
-        # Dequantize both and compare
-        ref_dequant = dequantize_int8(
-            ref_quant, ref_scale, block_size=128, output_dtype=torch.float32
-        )
-        fused_dequant = dequantize_int8(
-            fused_quant, fused_scale, block_size=128, output_dtype=torch.float32
-        )
-
-        # Use absolute error for GELU since values near zero cause numerical issues
-        abs_error = (ref_dequant - fused_dequant).abs()
-        # Normalize by the range of values
-        value_range = ref_dequant.abs().max() + 1e-8
-        normalized_error = abs_error / value_range
-        assert normalized_error.mean() < 0.1, (
-            f"Fused vs separate GELU error too high: {normalized_error.mean()}"
-        )
-
-    def test_int8_gelu_3d_input(self, cuda_available, seed):
-        """Test fused GELU with 3D input (batched)."""
-        from comfy_kitchen.backends.triton.quantization import (
-            quantize_int8,
-            int8_gelu,
-        )
-
-        # 3D input: (batch, seq, hidden)
-        x = torch.randn(4, 64, 256, device="cuda", dtype=torch.float32)
-        qx, s_x = quantize_int8(x.reshape(-1, 256), block_size=128, is_weight=False)
-        qx = qx.reshape(4, 64, 256)
-        s_x = s_x.reshape(4, 64, 2)
-
-        fused_quant, fused_scale = int8_gelu(qx, s_x, block_size=128)
-
-        assert fused_quant.shape == (4, 64, 256)
-        assert fused_quant.dtype == torch.int8
-        assert fused_scale.shape == (4, 64, 2)

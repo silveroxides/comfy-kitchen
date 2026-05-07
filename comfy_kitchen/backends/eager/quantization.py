@@ -289,9 +289,6 @@ def dequantize_mxfp8(
         qx: Quantized FP8 tensor (float8_e4m3fn or float8_e5m2)
         block_scales: E8M0 block scales in swizzled layout (float8_e8m0fnu)
         output_type: Target output dtype
-
-    Returns:
-        Dequantized tensor
     """
     orig_shape = qx.shape
     rows, cols = orig_shape
@@ -511,368 +508,6 @@ def scaled_mm_int8(
 
 
 # =============================================================================
-# torch.library Custom Op Definitions
-# These are the entry points for torch.compile. They dispatch to the best
-# available backend via the registry.
-# =============================================================================
-
-
-@torch.library.custom_op("comfy_kitchen::quantize_fp8", mutates_args=())
-def _op_quantize_fp8(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    output_dtype_code: int,
-) -> torch.Tensor:
-    """Quantize tensor to FP8 format with per-tensor scaling.
-
-    Args:
-        x: Input tensor
-        scale: Scale tensor (scalar)
-        output_dtype_code: FP8 dtype code (5=float8_e4m3fn, 6=float8_e5m2)
-
-    Returns:
-        Quantized FP8 tensor
-    """
-    from comfy_kitchen.registry import registry
-
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
-    impl = registry.get_implementation("quantize_per_tensor_fp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_quantize_fp8.register_fake
-def _op_quantize_fp8_fake(x, scale, output_dtype_code):
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    return torch.empty_like(x, dtype=output_dtype)
-
-
-@torch.library.custom_op("comfy_kitchen::dequantize_fp8", mutates_args=())
-def _op_dequantize_fp8(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    output_dtype_code: int,
-) -> torch.Tensor:
-    """Dequantize tensor from FP8 format with per-tensor scaling.
-
-    Args:
-        x: Input FP8 tensor (float8_e4m3fn or float8_e5m2)
-        scale: Scale tensor (scalar)
-        output_dtype_code: Target dtype code (0=float32, 1=float16, 2=bfloat16)
-
-    Returns:
-        Dequantized tensor in specified output format
-    """
-    from comfy_kitchen.registry import registry
-
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
-    impl = registry.get_implementation("dequantize_per_tensor_fp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_dequantize_fp8.register_fake
-def _op_dequantize_fp8_fake(x, scale, output_dtype_code):
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    return torch.empty_like(x, dtype=output_dtype)
-
-
-@torch.library.custom_op("comfy_kitchen::quantize_nvfp4", mutates_args=())
-def _op_quantize_nvfp4(
-    x: torch.Tensor,
-    per_tensor_scale: torch.Tensor,
-    epsilon: float,
-    pad_16x: bool,
-    hi_first: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize tensor to NVFP4 format with block-wise scaling.
-
-    Args:
-        x: Input tensor (2D)
-        per_tensor_scale: Global scale factor
-        epsilon: Epsilon for numerical stability
-        pad_16x: If True, pad dimensions to be divisible by 16
-        hi_first: If True, the even-indexed element is packed into the high nibble (default).
-                  If False, the even-indexed element goes into the low nibble.
-
-    Returns:
-        Tuple of (quantized_tensor, block_scales)
-    """
-    from comfy_kitchen.registry import registry
-
-    kwargs = {
-        "x": x,
-        "per_tensor_scale": per_tensor_scale,
-        "epsilon": epsilon,
-        "pad_16x": pad_16x,
-        "hi_first": hi_first,
-    }
-    impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_quantize_nvfp4.register_fake
-def _op_quantize_nvfp4_fake(x, per_tensor_scale, epsilon, pad_16x, hi_first):
-    rows, cols = x.shape
-
-    if pad_16x:
-        rows = roundup(rows, 16)
-        cols = roundup(cols, 16)
-
-    # Packed output: 2 FP4 values per uint8
-    qdata = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
-
-    # Block scales: cuBLAS tiled layout
-    scale_rows = roundup(rows, 128)
-    scale_cols = roundup(cols // 16, 4)
-    block_scales = torch.empty((scale_rows, scale_cols), dtype=torch.float8_e4m3fn, device=x.device)
-
-    return qdata, block_scales
-
-
-@torch.library.custom_op("comfy_kitchen::dequantize_nvfp4", mutates_args=())
-def _op_dequantize_nvfp4(
-    qx: torch.Tensor,
-    per_tensor_scale: torch.Tensor,
-    block_scales: torch.Tensor,
-    output_dtype_code: int,
-    hi_first: bool,
-) -> torch.Tensor:
-    """Dequantize tensor from NVFP4 format with block-wise scaling.
-
-    Args:
-        qx: Quantized FP4 tensor (packed as uint8)
-        per_tensor_scale: Global scale factor
-        block_scales: Block scales in swizzled layout (float8_e4m3fn)
-        output_dtype_code: Target dtype code (0=float32, 1=float16, 2=bfloat16)
-        hi_first: If True, the high nibble is the even-indexed element (default).
-                  If False, the low nibble is the even-indexed element.
-
-    Returns:
-        Dequantized tensor in specified output format
-    """
-    from comfy_kitchen.registry import registry
-
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {
-        "qx": qx,
-        "per_tensor_scale": per_tensor_scale,
-        "block_scales": block_scales,
-        "output_type": output_dtype,
-        "hi_first": hi_first,
-    }
-    impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_dequantize_nvfp4.register_fake
-def _op_dequantize_nvfp4_fake(qx, per_tensor_scale, block_scales, output_dtype_code, hi_first):
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    # Unpacked shape: cols * 2 (since 2 FP4 values per uint8)
-    rows, cols_packed = qx.shape
-    return torch.empty((rows, cols_packed * 2), dtype=output_dtype, device=qx.device)
-
-
-@torch.library.custom_op("comfy_kitchen::scaled_mm_nvfp4", mutates_args=())
-def _op_scaled_mm_nvfp4(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    tensor_scale_a: torch.Tensor,
-    tensor_scale_b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    bias: torch.Tensor | None,
-    output_dtype_code: int,
-    alpha: torch.Tensor | None,
-) -> torch.Tensor:
-    """Matrix multiplication with NVFP4 quantized inputs.
-
-    Computes: y = (a @ b.T) * (tensor_scale_a * tensor_scale_b) + bias
-
-    Args:
-        a: Quantized matrix A (M, K//2) in uint8 format
-        b: Quantized matrix B (N, K//2) in uint8 format
-        tensor_scale_a: Global scale for A
-        tensor_scale_b: Global scale for B
-        block_scale_a: Block-wise scales for A
-        block_scale_b: Block-wise scales for B
-        bias: Optional bias vector
-        output_dtype_code: Output dtype code (0=float32, 1=float16, 2=bfloat16)
-        alpha: Output scale (tensor_scale_a * tensor_scale_b)
-
-    Returns:
-        Result tensor of shape (M, N)
-    """
-    from comfy_kitchen.registry import registry
-
-    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {
-        "a": a,
-        "b": b,
-        "tensor_scale_a": tensor_scale_a,
-        "tensor_scale_b": tensor_scale_b,
-        "block_scale_a": block_scale_a,
-        "block_scale_b": block_scale_b,
-        "bias": bias,
-        "out_dtype": out_dtype,
-        "alpha": alpha,
-    }
-    impl = registry.get_implementation("scaled_mm_nvfp4", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_scaled_mm_nvfp4.register_fake
-def _op_scaled_mm_nvfp4_fake(
-    a,
-    b,
-    tensor_scale_a,
-    tensor_scale_b,
-    block_scale_a,
-    block_scale_b,
-    bias,
-    output_dtype_code,
-    alpha,
-):
-    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    m = a.shape[0]
-    n = b.shape[0]
-    return torch.empty((m, n), dtype=out_dtype, device=a.device)
-
-
-# =============================================================================
-# MXFP8 Custom Ops
-# =============================================================================
-
-
-@torch.library.custom_op("comfy_kitchen::quantize_mxfp8", mutates_args=())
-def _op_quantize_mxfp8(
-    x: torch.Tensor,
-    pad_32x: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize tensor to MXFP8 format with block-wise E8M0 scaling.
-
-    MXFP8 uses block size 32 with power-of-2 (E8M0) block scales.
-
-    Args:
-        x: Input tensor (2D, shape M x K)
-        pad_32x: If True, pad dimensions to be divisible by 32
-
-    Returns:
-        Tuple of (quantized_fp8_tensor, block_scales_e8m0)
-    """
-    from comfy_kitchen.registry import registry
-
-    kwargs = {"x": x, "pad_32x": pad_32x}
-    impl = registry.get_implementation("quantize_mxfp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_quantize_mxfp8.register_fake
-def _op_quantize_mxfp8_fake(x, pad_32x):
-    rows, cols = x.shape
-
-    if pad_32x:
-        rows = roundup(rows, 32)
-        cols = roundup(cols, 32)
-
-    # FP8 output (not packed)
-    qdata = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device=x.device)
-
-    # Block scales: E8M0 in cuBLAS tiled layout
-    # Block size 32, so num_blocks = cols // 32
-    num_blocks = cols // 32
-    scale_rows = roundup(rows, 128)
-    scale_cols = roundup(num_blocks, 4)
-    block_scales = torch.empty(
-        (scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=x.device
-    )
-
-    return qdata, block_scales
-
-
-@torch.library.custom_op("comfy_kitchen::dequantize_mxfp8", mutates_args=())
-def _op_dequantize_mxfp8(
-    qx: torch.Tensor,
-    block_scales: torch.Tensor,
-    output_dtype_code: int,
-) -> torch.Tensor:
-    """Dequantize tensor from MXFP8 format.
-
-    Args:
-        qx: Quantized FP8 tensor (float8_e4m3fn)
-        block_scales: E8M0 block scales in swizzled layout (float8_e8m0fnu)
-        output_dtype_code: Target dtype code (0=float32, 1=float16, 2=bfloat16)
-
-    Returns:
-        Dequantized tensor in specified output format
-    """
-    from comfy_kitchen.registry import registry
-
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"qx": qx, "block_scales": block_scales, "output_type": output_dtype}
-    impl = registry.get_implementation("dequantize_mxfp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_dequantize_mxfp8.register_fake
-def _op_dequantize_mxfp8_fake(qx, block_scales, output_dtype_code):
-    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    return torch.empty_like(qx, dtype=output_dtype)
-
-
-@torch.library.custom_op("comfy_kitchen::scaled_mm_mxfp8", mutates_args=())
-def _op_scaled_mm_mxfp8(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    bias: torch.Tensor | None,
-    output_dtype_code: int,
-) -> torch.Tensor:
-    """Matrix multiplication with MXFP8 quantized inputs.
-
-    Computes: y = a @ b.T + bias
-
-    Args:
-        a: Quantized FP8 matrix A (M, K)
-        b: Quantized FP8 matrix B (N, K)
-        block_scale_a: E8M0 block scales for A in swizzled layout
-        block_scale_b: E8M0 block scales for B in swizzled layout
-        bias: Optional bias vector
-        output_dtype_code: Output dtype code (0=float32, 1=float16, 2=bfloat16)
-
-    Returns:
-        Result tensor of shape (M, N)
-    """
-    from comfy_kitchen.registry import registry
-
-    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {
-        "a": a,
-        "b": b,
-        "block_scale_a": block_scale_a,
-        "block_scale_b": block_scale_b,
-        "bias": bias,
-        "out_dtype": out_dtype,
-    }
-    impl = registry.get_implementation("scaled_mm_mxfp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_scaled_mm_mxfp8.register_fake
-def _op_scaled_mm_mxfp8_fake(a, b, block_scale_a, block_scale_b, bias, output_dtype_code):
-    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    m = a.shape[0]
-    n = b.shape[0]
-    return torch.empty((m, n), dtype=out_dtype, device=a.device)
-
-
-# TODO: add torch.library.custom_op wrappers for block-wise INT8 ops:
-# comfy_kitchen::quantize_int8, comfy_kitchen::dequantize_int8,
-# comfy_kitchen::scaled_mm_int8 — currently called via torch.ops but ops
-# not registered, so comfy_kitchen.quantize_int8() etc. raise AttributeError.
-
-# =============================================================================
 # INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
 # =============================================================================
 # Simpler approach: single scale per tensor + per-row activation scaling.
@@ -1010,8 +645,313 @@ def int8_linear(
 
 
 # =============================================================================
-# torch.library Custom Op Definitions — INT8 Tensor-wise
+# torch.library Custom Op Definitions
+# These are the entry points for torch.compile. They dispatch to the best
+# available backend via the registry.
 # =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_fp8", mutates_args=())
+def _op_quantize_fp8(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
+    impl = registry.get_implementation("quantize_per_tensor_fp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_fp8.register_fake
+def _op_quantize_fp8_fake(x, scale, output_dtype_code):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty_like(x, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_fp8", mutates_args=())
+def _op_dequantize_fp8(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
+    impl = registry.get_implementation("dequantize_per_tensor_fp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_fp8.register_fake
+def _op_dequantize_fp8_fake(x, scale, output_dtype_code):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty_like(x, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_nvfp4", mutates_args=())
+def _op_quantize_nvfp4(
+    x: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    epsilon: float,
+    pad_16x: bool,
+    hi_first: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {
+        "x": x,
+        "per_tensor_scale": per_tensor_scale,
+        "epsilon": epsilon,
+        "pad_16x": pad_16x,
+        "hi_first": hi_first,
+    }
+    impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_nvfp4.register_fake
+def _op_quantize_nvfp4_fake(x, per_tensor_scale, epsilon, pad_16x, hi_first):
+    rows, cols = x.shape
+    if pad_16x:
+        rows = roundup(rows, 16)
+        cols = roundup(cols, 16)
+    qdata = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
+    scale_rows = roundup(rows, 128)
+    scale_cols = roundup(cols // 16, 4)
+    block_scales = torch.empty((scale_rows, scale_cols), dtype=torch.float8_e4m3fn, device=x.device)
+    return qdata, block_scales
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_nvfp4", mutates_args=())
+def _op_dequantize_nvfp4(
+    qx: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_dtype_code: int,
+    hi_first: bool,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "qx": qx,
+        "per_tensor_scale": per_tensor_scale,
+        "block_scales": block_scales,
+        "output_type": output_dtype,
+        "hi_first": hi_first,
+    }
+    impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_nvfp4.register_fake
+def _op_dequantize_nvfp4_fake(qx, per_tensor_scale, block_scales, output_dtype_code, hi_first):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    rows, cols_packed = qx.shape
+    return torch.empty((rows, cols_packed * 2), dtype=output_dtype, device=qx.device)
+
+
+@torch.library.custom_op("comfy_kitchen::scaled_mm_nvfp4", mutates_args=())
+def _op_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+    alpha: torch.Tensor | None,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a": a,
+        "b": b,
+        "tensor_scale_a": tensor_scale_a,
+        "tensor_scale_b": tensor_scale_b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "alpha": alpha,
+    }
+    impl = registry.get_implementation("scaled_mm_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_scaled_mm_nvfp4.register_fake
+def _op_scaled_mm_nvfp4_fake(
+    a, b, tensor_scale_a, tensor_scale_b, block_scale_a, block_scale_b, bias, output_dtype_code, alpha
+):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty((a.shape[0], b.shape[0]), dtype=out_dtype, device=a.device)
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_mxfp8", mutates_args=())
+def _op_quantize_mxfp8(
+    x: torch.Tensor,
+    pad_32x: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x, "pad_32x": pad_32x}
+    impl = registry.get_implementation("quantize_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_mxfp8.register_fake
+def _op_quantize_mxfp8_fake(x, pad_32x):
+    rows, cols = x.shape
+    if pad_32x:
+        rows = roundup(rows, 32)
+        cols = roundup(cols, 32)
+    qdata = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device=x.device)
+    num_blocks = cols // 32
+    scale_rows = roundup(rows, 128)
+    scale_cols = roundup(num_blocks, 4)
+    block_scales = torch.empty(
+        (scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=x.device
+    )
+    return qdata, block_scales
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_mxfp8", mutates_args=())
+def _op_dequantize_mxfp8(
+    qx: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {"qx": qx, "block_scales": block_scales, "output_type": output_dtype}
+    impl = registry.get_implementation("dequantize_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_mxfp8.register_fake
+def _op_dequantize_mxfp8_fake(qx, block_scales, output_dtype_code):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty_like(qx, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::scaled_mm_mxfp8", mutates_args=())
+def _op_scaled_mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a": a,
+        "b": b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "bias": bias,
+        "out_dtype": out_dtype,
+    }
+    impl = registry.get_implementation("scaled_mm_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_scaled_mm_mxfp8.register_fake
+def _op_scaled_mm_mxfp8_fake(a, b, block_scale_a, block_scale_b, bias, output_dtype_code):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty((a.shape[0], b.shape[0]), dtype=out_dtype, device=a.device)
+
+
+# =============================================================================
+# INT8 Custom Ops
+# =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8", mutates_args=())
+def _op_quantize_int8(
+    x: torch.Tensor,
+    block_size: int,
+    is_weight: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x, "block_size": block_size, "is_weight": is_weight}
+    impl = registry.get_implementation("quantize_int8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8.register_fake
+def _op_quantize_int8_fake(x, block_size, is_weight):
+    q = torch.empty_like(x, dtype=torch.int8)
+    if is_weight:
+        scale = torch.empty((x.shape[0] // block_size, x.shape[1] // block_size), dtype=torch.float32, device=x.device)
+    else:
+        scale = torch.empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8", mutates_args=())
+def _op_dequantize_int8(
+    qx: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "qx": qx,
+        "scale": scale,
+        "block_size": block_size,
+        "output_type": output_dtype,
+    }
+    impl = registry.get_implementation("dequantize_int8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8.register_fake
+def _op_dequantize_int8_fake(qx, scale, block_size, output_dtype_code):
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty_like(qx, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::scaled_mm_int8", mutates_args=())
+def _op_scaled_mm_int8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a": a,
+        "b": b,
+        "scale_a": scale_a,
+        "scale_b": scale_b,
+        "bias": bias,
+        "out_dtype": out_dtype,
+    }
+    impl = registry.get_implementation("scaled_mm_int8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_scaled_mm_int8.register_fake
+def _op_scaled_mm_int8_fake(a, b, scale_a, scale_b, bias, output_dtype_code):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty((*a.shape[:-1], b.shape[0]), dtype=out_dtype, device=a.device)
 
 
 @torch.library.custom_op("comfy_kitchen::quantize_int8_tensorwise", mutates_args=())

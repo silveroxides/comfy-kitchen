@@ -161,17 +161,16 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.int8}),
                     shape_rules=(ExactDims(2),),
                 ),
-                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "weight_scale": ParamConstraint(dtypes=standard_floats),
             },
-            default_devices=cuda_devices,
-            min_compute_capability=(7, 5),
+            default_devices=triton_devices,
+            min_compute_capability=(8, 0),  # Required for Triton INT8 dot
         ),
         "quantize_int8_rowwise": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
             },
-            default_devices=cuda_devices,
-            min_compute_capability=(7, 5),
+            default_devices=triton_devices,
         ),
     }
 

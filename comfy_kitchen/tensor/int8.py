@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Block-wise INT8 quantization layout for tensor cores.
+"""INT8 quantization layouts.
 
-This provides a QuantizedTensor layout for block-wise INT8 quantization,
-following the same patterns as TensorCoreFP8Layout and TensorCoreMXFP8Layout.
+This provides QuantizedTensor layouts for block-wise and tensor-wise INT8 quantization.
 """
 
 from __future__ import annotations
@@ -288,7 +287,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
 
 
 # =============================================================================
-# INT8 Matmul Operations
+# INT8 Matmul Operations (Block-wise)
 # =============================================================================
 
 
@@ -455,13 +454,7 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
             input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
         )
     except Exception as e:
-        import traceback
-
-        err_msg = (
-            f"Triton INT8 scaled_mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
-        )
-        print(err_msg)  # Force print to stdout
-        logger.debug(err_msg)
+        logger.debug(f"Triton INT8 scaled_mm failed: {e}, falling back to eager")
 
     # Fallback to eager backend
     try:
@@ -471,11 +464,7 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
             input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
         )
     except Exception as e:
-        import traceback
-
-        err_msg = f"Eager INT8 scaled_mm failed: {e}\n{traceback.format_exc()}\nfalling back to dequantization"
-        print(err_msg)  # Force print to stdout
-        logger.debug(err_msg)
+        logger.debug(f"Eager INT8 scaled_mm failed: {e}, falling back to dequantization")
 
     # Final fallback
     return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
@@ -508,11 +497,7 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
             input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
         )
     except Exception as e:
-        import traceback
-
-        err_msg = f"Triton INT8 mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
-        print(err_msg)
-        logger.debug(err_msg)
+        logger.debug(f"Triton INT8 mm failed: {e}, falling back to eager")
 
     try:
         from comfy_kitchen.backends.eager.quantization import int8_linear
@@ -521,13 +506,7 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
             input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
         )
     except Exception as e:
-        import traceback
-
-        err_msg = (
-            f"Eager INT8 mm failed: {e}\n{traceback.format_exc()}\nfalling back to dequantization"
-        )
-        print(err_msg)
-        logger.debug(err_msg)
+        logger.debug(f"Eager INT8 mm failed: {e}, falling back to dequantization")
 
     return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
 
