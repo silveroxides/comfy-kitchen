@@ -45,7 +45,7 @@ class INT8LinearTensorwise(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
-        
+
         if weight_int8 is not None:
             self.weight = nn.Parameter(weight_int8, requires_grad=False)
             self.register_buffer("weight_scale", weight_scale)
@@ -83,10 +83,10 @@ class INT8LinearTensorwise(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward with dynamic per-row activation quantization."""
         orig_shape = x.shape
-        
+
         # Flatten to 2D and use int8_linear
         x_2d = x.reshape(-1, x.shape[-1])
-        
+
         if x_2d.shape[0] > 16:
             # Use fast INT8 matmul path
             y = int8_linear(x_2d, self.weight, self.weight_scale, self.bias, self.compute_dtype)
@@ -166,8 +166,8 @@ def patch_model_with_int8_tensorwise(
                     continue
 
                 try:
-                    int8_linear = INT8LinearTensorwise.from_linear(child)
-                    setattr(module, name, int8_linear)
+                    int8_linear_mod = INT8LinearTensorwise.from_linear(child)
+                    setattr(module, name, int8_linear_mod)
                     patched_count += 1
                     if verbose:
                         print(f"    ✓ {full_name} ({child.in_features}x{child.out_features})")

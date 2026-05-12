@@ -17,6 +17,10 @@ __all__ = [
     "scaled_mm_int8",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
+    "dequantize_int8_simple",
+    "int8_linear",
 ]
 
 from .quantization import (
@@ -36,6 +40,10 @@ from .quantization import (
     scaled_mm_int8,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
+    dequantize_int8_simple,
+    int8_linear,
 )
 from .rope import apply_rope, apply_rope1
 
@@ -201,6 +209,34 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
     }
+
+    out["quantize_int8_tensorwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int8_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_simple"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["int8_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
 
     if hasattr(torch, "float8_e8m0fnu"):
         out["quantize_mxfp8"] = FunctionConstraints(
