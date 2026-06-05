@@ -750,6 +750,18 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8 and b.dtype == torch.int8
     assert a.dim() == 2 and b.dim() == 2
     assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
+
+    # Check for M < 16 constraint on CUDA
+    # Note: Some versions of cuBLASLt/PyTorch require M > 16
+    if a.is_cuda and a.size(0) <= 16:
+        m_orig = a.size(0)
+        a_padded = torch.nn.functional.pad(a, (0, 0, 0, 32 - m_orig))
+        if hasattr(torch, "int8_mm"):
+            result_padded = torch.int8_mm(a_padded, b)
+        else:
+            result_padded = torch._int_mm(a_padded, b)
+        return result_padded[:m_orig]
+
     if hasattr(torch, "int8_mm"):
         return torch.int8_mm(a, b)
     return torch._int_mm(a, b)
@@ -827,15 +839,31 @@ def int8_linear(
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
+    # Re-quantize to tensorwise if weight is per-channel
+    # This ensures compatibility with eager INT8 path on consumer hardware
+    if weight_scale.numel() > 1:
+        w_float = dequantize_int8_simple(weight, weight_scale)
+        weight, weight_scale = quantize_int8_tensorwise(w_float)
+
     # Quantize input per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
     # Compute: x_8 @ weight.T using torch.int8_mm (public API) or torch._int_mm
     # weight is [N, K], we need [K, N] for matmul so transpose
-    if hasattr(torch, "int8_mm"):
-        result = torch.int8_mm(x_8, weight.T.contiguous())
+    # Check for M < 16 constraint on CUDA
+    if x_8.is_cuda and x_8.size(0) <= 16:
+        m_orig = x_8.size(0)
+        x_8_padded = torch.nn.functional.pad(x_8, (0, 0, 0, 32 - m_orig))
+        if hasattr(torch, "int8_mm"):
+            result_padded = torch.int8_mm(x_8_padded, weight.T.contiguous())
+        else:
+            result_padded = torch._int_mm(x_8_padded, weight.T.contiguous())
+        result = result_padded[:m_orig]
     else:
-        result = torch._int_mm(x_8, weight.T.contiguous())
+        if hasattr(torch, "int8_mm"):
+            result = torch.int8_mm(x_8, weight.T.contiguous())
+        else:
+            result = torch._int_mm(x_8, weight.T.contiguous())
 
     # Scale back efficiently: result * (weight_scale * x_scale)
     # Process in chunks to avoid materializing large float32 tensor
