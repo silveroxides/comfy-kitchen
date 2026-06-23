@@ -49,7 +49,7 @@ cublasLtHandle_t get_cublas_lt_handle_int8() {
   if (!runtime.is_available()) {
     throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
   }
-  
+
   if (cached_int8_handle == nullptr) {
     cublasStatus_t status = runtime.cublasLtCreate(&cached_int8_handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -69,7 +69,7 @@ void cublas_gemm_int8_impl(
     void* workspace_ptr,
     int64_t workspace_size,
     cudaStream_t stream) {
-  
+
   auto& runtime = CublasLtRuntime::instance();
   if (!runtime.is_available()) {
     throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
@@ -86,11 +86,11 @@ void cublas_gemm_int8_impl(
   CUBLAS_CHECK(runtime.cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
 
   // In cuBLAS column-major terms, we want to compute C_col = B_row @ A_row^T
-  // B_row in memory is [N, K] row-major -> [K, N] col-major. 
+  // B_row in memory is [N, K] row-major -> [K, N] col-major.
   // We want to multiply by B_row, so we need to transpose the [K, N] col-major matrix. transA = T.
-  // A_row in memory is [M, K] row-major -> [K, M] col-major. 
+  // A_row in memory is [M, K] row-major -> [K, M] col-major.
   // This is already A_row^T, so we don't transpose it. transB = N.
-  
+
   const cublasOperation_t transa = CUBLAS_OP_T;
   const cublasOperation_t transb = CUBLAS_OP_N;
   CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
@@ -100,7 +100,7 @@ void cublas_gemm_int8_impl(
 
   // Matrix layouts: INT8 inputs, INT32 output
   cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
-  
+
   // First operand is B_ptr. Shape [K, N] col-major.
   CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, K, N, K));
   // Second operand is A_ptr. Shape [K, M] col-major.
@@ -115,7 +115,7 @@ void cublas_gemm_int8_impl(
   // Preference and heuristic
   cublasLtMatmulPreference_t preference = nullptr;
   CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceCreate(&preference));
-  
+
   size_t ws_size = workspace_size > 0 ? workspace_size : 0;
   CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceSetAttribute(
       preference,
@@ -125,7 +125,7 @@ void cublas_gemm_int8_impl(
 
   cublasLtMatmulHeuristicResult_t heuristicResult = {};
   int returnedResults = 0;
-  
+
   const auto status = runtime.cublasLtMatmulAlgoGetHeuristic(
       ltHandle,
       operationDesc,
@@ -147,6 +147,11 @@ void cublas_gemm_int8_impl(
     throw std::runtime_error("INT8 GEMM not supported on this GPU for these dimensions (requires SM >= 7.5, and dimensions multiple of 4).");
   }
   if (status != CUBLAS_STATUS_SUCCESS) {
+    if (preference) runtime.cublasLtMatmulPreferenceDestroy(preference);
+    if (Cdesc) runtime.cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) runtime.cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) runtime.cublasLtMatrixLayoutDestroy(Adesc);
+    if (operationDesc) runtime.cublasLtMatmulDescDestroy(operationDesc);
     throw std::runtime_error(std::string("cuBLAS heuristic error: ") + std::to_string(status));
   }
 
@@ -194,7 +199,7 @@ void launch_cublas_gemm_int8_kernel(
     void* workspace_ptr,
     int64_t workspace_size,
     cudaStream_t stream) {
-  
+
   comfy::cublas_gemm_int8_impl(
       static_cast<const int8_t*>(A_ptr),
       static_cast<const int8_t*>(B_ptr),
