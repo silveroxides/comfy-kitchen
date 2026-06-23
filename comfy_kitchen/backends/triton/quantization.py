@@ -922,7 +922,7 @@ def _int8_matmul_dequant_kernel(
     # 4. Store Result
     c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    tl.store(c_ptrs, c.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 @triton.autotune(
     configs=[
@@ -999,7 +999,7 @@ def _int8_matmul_dequant_per_row_kernel(
     # 4. Store Result
     c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    tl.store(c_ptrs, c.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 def int8_linear(
     x: torch.Tensor,

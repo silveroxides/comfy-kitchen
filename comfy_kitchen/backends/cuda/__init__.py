@@ -29,6 +29,8 @@ __all__ = [
     "dequantize_per_tensor_fp8",
     "int8_linear",
     "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
+    "dequantize_int8_simple",
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
@@ -321,6 +323,18 @@ def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return eager_quantize(x)
 
 
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 tensor-wise (for weights)."""
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise as eager_quantize
+    return eager_quantize(x)
+
+
+def dequantize_int8_simple(qdata: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 simple/tensor-wise back to original dtype."""
+    from comfy_kitchen.backends.eager.quantization import dequantize_int8_simple as eager_dequantize
+    return eager_dequantize(qdata, scale)
+
+
 def quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused online activation rotation + row-wise quantization."""
     from comfy_kitchen.backends.eager.quantization import quantize_and_rotate_rowwise as eager_quantize_rotate
@@ -509,7 +523,8 @@ def int8_linear(
 
     m, k = x.shape
     n, k_w = weight.shape
-    assert k == k_w, "Input and weight inner dimensions must match"
+    if k != k_w:
+        raise ValueError("Input and weight inner dimensions must match")
 
     # cuBLAS INT8 GEMM outputs int32
     out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)

@@ -857,17 +857,14 @@ def int8_linear(
 
     # Compute: x_8 @ weight.T using torch.int8_mm (public API) or torch._int_mm
     # weight is [N, K], we need [K, N] for matmul so transpose
-    if hasattr(torch, "int8_mm"):
-        result = torch.int8_mm(x_8, weight.T.contiguous())
-    else:
-        result = torch._int_mm(x_8, weight.T.contiguous())
+    result = mm_int8(x_8, weight.T.contiguous())
 
     # Scale back efficiently: result * (weight_scale * x_scale)
     # Process in chunks to avoid materializing large float32 tensor
     # which causes OOM for large models
 
     M, N = result.shape
-    chunk_size = max(1, min(M, 256 * 1024 * 1024 // (N * 4)))  # Estimate safe chunk size
+    chunk_size = max(1, min(M, 256 * 1024 * 1024 // (max(1, N) * 4)))  # Estimate safe chunk size
 
     weight_scale = weight_scale.view(-1)
     scaled_parts = []

@@ -315,10 +315,11 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
 
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
+    weight_scale_transposed = weight_scale.t() if weight_scale is not None and weight_scale.ndim > 1 else weight_scale
     return ck.int8_linear(
         input_tensor.contiguous(),
         weight_qdata.t().contiguous(),
-        weight_scale,
+        weight_scale_transposed,
         None,
         out_dtype,
         convrot=convrot,
@@ -348,12 +349,33 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    return ck.int8_linear(
-        input_tensor.contiguous(),
-        weight_qdata.t().contiguous(),
-        weight_scale,
-        bias,
-        out_dtype,
-        convrot=convrot,
-        convrot_groupsize=convrot_groupsize,
-    )
+    weight_scale_transposed = weight_scale.t() if weight_scale is not None and weight_scale.ndim > 1 else weight_scale
+
+    alpha = kwargs.get("alpha", 1)
+    beta = kwargs.get("beta", 1)
+
+    if alpha == 1 and beta == 1:
+        return ck.int8_linear(
+            input_tensor.contiguous(),
+            weight_qdata.t().contiguous(),
+            weight_scale_transposed,
+            bias,
+            out_dtype,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
+        )
+    else:
+        out = ck.int8_linear(
+            input_tensor.contiguous(),
+            weight_qdata.t().contiguous(),
+            weight_scale_transposed,
+            None,
+            out_dtype,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
+        )
+        if alpha != 1:
+            out = out * alpha
+        if bias is not None:
+            out = out + (bias * beta)
+        return out
