@@ -113,8 +113,20 @@ def dequantize_fp8_kernel_tl(
     # Load scale value from device tensor
     scale = tl.load(scale_ptr)
 
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    dequantized = x.to(tl.float32) * scale
+    # 1. Load as raw uint8 to bypass Triton's hardware checks
+    x_u8 = tl.load(x_ptr + offsets, mask=mask, other=0)
+    
+    # 2. Bitcast to a supported FP8 format on RTX 3090 (Ampere)
+    x_b15 = x_u8.to(tl.float8e4b15, bitcast=True)
+    
+    # 3. Convert to float32
+    x_f32 = x_b15.to(tl.float32)
+    
+    # 4. Correct the exponent bias difference (15 - 7 = 8). 2^8 = 256.0
+    x_f32_corrected = x_f32 * 256.0
+    
+    # 5. Apply the model scale
+    dequantized = x_f32_corrected * scale
 
     tl.store(output_ptr + offsets, dequantized, mask=mask)
 
@@ -142,8 +154,10 @@ def dequantize_per_tensor_fp8(
 
     grid = (triton.cdiv(n_elements, block_size),)
 
+    # Note: We pass x_flat.view(torch.uint8) to prevent the PyTorch-to-Triton 
+    # dispatcher from rejecting the launch due to the unsupported dtype.
     dequantize_fp8_kernel_tl[grid](
-        x_flat,
+        x_flat.view(torch.uint8),
         output,
         scale,
         n_elements,
